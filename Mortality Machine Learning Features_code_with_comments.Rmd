@@ -1,0 +1,1607 @@
+---
+title: "Mortality Machine Learning Feature Table"
+author: "Author: Tianyi Zhang, the University of Georgia"
+date: "2024-01-10"
+output:
+  bookdown::html_document2:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+```
+
+```{r}
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyverse"))
+suppressMessages(library("readr"))
+suppressMessages(library("readxl"))
+suppressMessages(library("stringr"))
+suppressMessages(library("imputeTS"))
+```
+
+In the following cells, we read the data first.
+
+```{r}
+flowsheets_alt=read_csv("flowsheets_w_ht_wt.csv",
+                        col_types = cols(MEAS_VALUE = col_character())
+                        )
+ICU_stay_time=read_csv("ICU Stay Time.csv")
+flowsheets_alt = left_join(flowsheets_alt,ICU_stay_time)
+```
+
+```{r}
+labs=read_csv("labs.csv",
+              col_types = cols(PATIENT_DEID = col_character(),
+                               ENCOUNTER_DEID = col_character(),
+                               RESULT_DATE_DEID = col_datetime(format = ""),
+                               COMPONENT_ID = col_double(),
+                               NAME = col_character(),
+                               BASE_NAME = col_character(),
+                               EXTERNAL_NAME = col_character(),
+                               ORD_VALUE = col_character(),
+                               ABNORMAL_YN = col_character(),
+                               RESULT_FLAG_NAME = col_character(),
+                               DESCRIPTION = col_character(),
+                               SPECIMEN_TYPE_NAME = col_character(),
+                               LOINC = col_character(),
+                               REFERENCE_LOW = col_character(),
+                               REFERENCE_HIGH = col_character(),
+                               REFERENCE_UNIT = col_character()
+                               )
+              )
+labs = left_join(labs,ICU_stay_time,by = "PATIENT_DEID")
+```
+
+```{r}
+data_master=read_excel("Master Table_Data Dictionary_3.31.23.xlsx",
+                       sheet="UNC  1000",
+                       range="A1:BB992",col_names=T,na="NA")%>%
+  dplyr::select(PATIENT_DEID,"Age @ ICU Admission",
+                "Sex","MRC_24h","ICU Type","MV @ 24 hours",
+                "Fluid Balance - Day 1 (L)","Admission Diagnosis, Broad Category")%>%
+  mutate(`Admission Diagnosis, Broad Category`=ifelse(is.na(`Admission Diagnosis, Broad Category`),"Other",
+                                                      `Admission Diagnosis, Broad Category`))
+CRRT_Vassopressor_24=read.csv("data_fluid.overload_v2_01.12.csv")%>%
+  dplyr::select(PATIENT_DEID,CRRT_24h,Vasopressor_24h)
+data_master=full_join(data_master,CRRT_Vassopressor_24)
+```
+
+In the following cells, we created all variables we are interested in using the initial records.
+
+```{r}
+##Heart rate
+mid_hr=(60+90)/2
+heart_rate=flowsheets_alt%>%
+  filter(FLO_MEAS_NAME=="PULSE",
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(heart_rate=as.numeric(str_extract(MEAS_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=heart_rate-mid_hr)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_heart_rate_24h = heart_rate[which.max(abs(dist_mid))],
+            highest_heart_rate_24h = max(heart_rate))
+```
+
+```{r}
+##SBP
+mid_sbp=(100+160)/2
+Blood_pressure=flowsheets_alt%>%
+  filter(FLO_MEAS_NAME=="BLOOD PRESSURE",
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(SBP=as.numeric(str_split(MEAS_VALUE, "/", simplify = TRUE)[,1]),
+         #DBP=as.numeric(str_split(MEAS_VALUE, "/", simplify = TRUE)[,2]),
+         dist_sbp_mid=SBP-mid_sbp
+         )%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_SBP_24h = SBP[which.max(abs(dist_sbp_mid))],
+            lowest_SBP_24h=min(SBP))
+```
+
+```{r}
+##MAP
+mid_map=(65+100)/2
+Mean_arterial_pressure=flowsheets_alt%>%
+  filter(FLO_MEAS_NAME%in%c("R MAP A-LINE","R MAP A-LINE 2","R MAP A-LINE 3"),
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(MAP=as.numeric(str_extract(MEAS_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=MAP-mid_map)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_MAP_24h = MAP[which.max(abs(dist_mid))],
+            lowest_MAP_24h = min(MAP))
+```
+
+```{r}
+##Temperature
+mid_tem=(96.98+98.96)/2
+temperature=flowsheets_alt%>%
+  filter(FLO_MEAS_NAME=="TEMPERATURE",
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(temperature=as.numeric(str_extract(MEAS_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=temperature-mid_tem)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_temperature_24h = temperature[which.max(abs(dist_mid))])
+```
+
+```{r}
+##PaO2
+PaO2=labs%>%filter(EXTERNAL_NAME=="pO2, Arterial",
+                   difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                   difftime(ORDER_INST_DEID,start,units="hours")<24,
+                   difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(lowest_PaO2_24h = min(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+```
+
+```{r}
+##pH
+mid_pH=(7.35+7.45)/2
+pH=labs%>%filter(EXTERNAL_NAME=="pH, Arterial",
+                 difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                 difftime(ORDER_INST_DEID,start,units="hours")<24,
+                 difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(pH=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=pH-mid_pH)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_pH_24h = pH[which.max(abs(dist_mid))])
+```
+
+```{r}
+##PaCO2
+mid_PaCO2=(35+45)/2
+PaCO2=labs%>%filter(EXTERNAL_NAME=="pCO2, Arterial",
+                   difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                   difftime(ORDER_INST_DEID,start,units="hours")<24,
+                   difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(PaCO2=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=PaCO2-mid_PaCO2)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_PaCO2_24h = PaCO2[which.max(abs(dist_mid))])
+```
+
+```{r}
+##Bicarbonate
+mid_bicarbonate=(22+26)/2
+bicarbonate=labs%>%filter(EXTERNAL_NAME=="CO2",
+                          difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                          difftime(ORDER_INST_DEID,start,units="hours")<24,
+                          difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(bicarbonate=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=bicarbonate-mid_bicarbonate)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_bicarbonate_24h = bicarbonate[which.max(abs(dist_mid))])
+```
+
+```{r}
+##Creatinine
+creatinine=labs%>%filter(EXTERNAL_NAME=="Creatinine",
+                          difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                          difftime(ORDER_INST_DEID,start,units="hours")<24,
+                          difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(highest_creatinine_24h = max(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+```
+
+```{r}
+##Blood glucose
+mid_bg=(70+180)/2
+blood_glucose=labs%>%filter(EXTERNAL_NAME%in%c("Glucose","Glucose, POC"),
+                            difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                            difftime(ORDER_INST_DEID,start,units="hours")<24,
+                            difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(blood_glucose=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=blood_glucose-mid_bg)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_blood_glucose_24h = blood_glucose[which.max(abs(dist_mid))])
+```
+
+```{r}
+##WBC
+mid_wbc=(4.5+11)/2
+WBC=labs%>%filter(EXTERNAL_NAME=="WBC",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(WBC=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=WBC-mid_wbc)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_WBC_24h = WBC[which.max(abs(dist_mid))])
+```
+
+```{r}
+##Lactate
+lactate=labs%>%filter(BASE_NAME=="LACTATE",
+                      difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                      difftime(ORDER_INST_DEID,start,units="hours")<24,
+                      difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(highest_lactate_24h = max(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+```
+
+```{r}
+##Potassium
+mid_pot=(3.5+5.2)/2
+potassium=labs%>%filter(NAME=="POTASSIUM",
+                        difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                        difftime(ORDER_INST_DEID,start,units="hours")<24,
+                        difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(potassium=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=potassium-mid_pot)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_potassium_24h = potassium[which.max(abs(dist_mid))])
+```
+
+```{r}
+##Sodium
+mid_sod=(135+145)/2
+sodium=labs%>%filter(NAME=="SODIUM",
+                     difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                     difftime(ORDER_INST_DEID,start,units="hours")<24,
+                     difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(sodium=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=sodium-mid_sod)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_sodium_24h = sodium[which.max(abs(dist_mid))])
+```
+
+```{r}
+##Albumin
+mid_alb=(3.5+5.4)/2
+albumin=labs%>%filter(NAME=="ALBUMIN",
+                     difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                     difftime(ORDER_INST_DEID,start,units="hours")<24,
+                     difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(albumin=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=albumin-mid_alb)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_albumin_24h = albumin[which.max(abs(dist_mid))],
+            lowest_albumin_24h = min(albumin))
+```
+
+```{r}
+##AST
+mid_AST=(8+33)/2
+AST=labs%>%filter(EXTERNAL_NAME=="AST",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(AST=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=AST-mid_AST)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_AST_24h = AST[which.max(abs(dist_mid))],
+            highest_AST_24h = max(AST))
+```
+
+```{r}
+##ALT
+mid_ALT=(4+36)/2
+ALT=labs%>%filter(EXTERNAL_NAME=="ALT",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(ALT=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=ALT-mid_ALT)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_ALT_24h = ALT[which.max(abs(dist_mid))],
+            highest_ALT_24h = max(ALT))
+```
+
+```{r}
+##HGB
+HGB=labs%>%filter(EXTERNAL_NAME=="HGB",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_HGB_24h = min(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+```
+
+```{r}
+##HCT
+HCT=labs%>%filter(EXTERNAL_NAME=="HCT",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_HCT_24h = min(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+```
+
+```{r}
+##PLT
+mid_PLT=(150+450)/2
+PLT=labs%>%filter(grepl("PLATELET",NAME),
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(PLT=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=PLT-mid_PLT)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_PLT_24h = PLT[which.max(abs(dist_mid))])
+```
+
+```{r}
+##INR
+INR=labs%>%filter(EXTERNAL_NAME=="INR",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(highest_INR_24h = max(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+```
+
+```{r}
+##PaO2/FiO2
+PaO2r = labs%>%filter(EXTERNAL_NAME=="pO2, Arterial")%>%
+  select(PATIENT_DEID,ORDER_INST_DEID, ORD_VALUE, start, end)%>%
+  mutate(PaO2 = as.numeric(str_extract(ORD_VALUE,"\\d+\\.*\\d*")))%>%
+  rename(RECORDED_TIME_DEID = ORDER_INST_DEID)%>%select(-ORD_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)
+
+FiO2r = flowsheets_alt%>%filter(DISP_NAME=="FiO2 (%)")%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE, start, end)%>%
+  mutate(FiO2 = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  mutate(FiO2 = ifelse(FiO2>1, ifelse(FiO2>=10,FiO2/100, FiO2/10), FiO2))%>%
+  filter(difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(FiO2!=0)
+
+Respiratory_f = full_join(FiO2r,PaO2r)%>%group_by(PATIENT_DEID)
+
+PaO2_patients = unique(PaO2r$PATIENT_DEID)
+FiO2_patients = unique(FiO2r$PATIENT_DEID)
+
+manual_resp_sofa_patients = intersect(PaO2_patients,FiO2_patients)
+
+Respiratory_red= Respiratory_f%>%
+  filter(PATIENT_DEID %in% manual_resp_sofa_patients)%>%
+  group_by(PATIENT_DEID)%>%arrange(RECORDED_TIME_DEID)
+
+PaO2_over_FiO2_24h = Respiratory_red%>%mutate(FiO2_impute = na_locf(FiO2,option = "locf"))%>%filter(!is.na(PaO2))%>%
+  mutate(PaO2_over_FiO2 = PaO2/FiO2_impute)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_PaO2_over_FiO2_24h=min(PaO2_over_FiO2))
+```
+
+```{r}
+##Mechanical Ventilation
+MV_list=(data_master%>%
+           filter(`MV @ 24 hours`!="none"))$PATIENT_DEID
+MV=flowsheets_alt%>%
+  filter(str_detect(MEAS_VALUE,"Ventilator"))%>%
+  group_by(PATIENT_DEID)%>%
+  filter(length(PATIENT_DEID)>1,
+         PATIENT_DEID%in%MV_list)%>%
+  summarise(MV_start_time=min(RECORDED_TIME_DEID))
+```
+
+```{r}
+#FiO2
+flowsheets_alt_add=left_join(flowsheets_alt,MV)
+Fi02=flowsheets_alt_add%>%filter(DISP_NAME=="FiO2 (%)",
+                                 PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE,MV_start_time)%>%
+  mutate(FiO2 = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  mutate(FiO2 = ifelse(FiO2>1, ifelse(FiO2>=10,FiO2/100, FiO2/10), FiO2))%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(highest_Fi02_24h_if_MV = max(FiO2,na.rm=T))
+```
+
+```{r}
+##PaO2/FiO2 if MV
+labs_add=left_join(labs,MV)
+PaO2r = labs_add%>%filter(EXTERNAL_NAME=="pO2, Arterial",
+                          PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,ORDER_INST_DEID, ORD_VALUE, MV_start_time)%>%
+  mutate(PaO2 = as.numeric(str_extract(ORD_VALUE,"\\d+\\.*\\d*")))%>%
+  rename(RECORDED_TIME_DEID = ORDER_INST_DEID)%>%select(-ORD_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)
+
+FiO2r = flowsheets_alt_add%>%filter(DISP_NAME=="FiO2 (%)",
+                                    PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE, MV_start_time)%>%
+  mutate(FiO2 = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  mutate(FiO2 = ifelse(FiO2>1, ifelse(FiO2>=10,FiO2/100, FiO2/10), FiO2))%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  filter(FiO2!=0)
+
+Respiratory_f = full_join(FiO2r,PaO2r)%>%group_by(PATIENT_DEID)
+
+PaO2_patients = unique(PaO2r$PATIENT_DEID)
+FiO2_patients = unique(FiO2r$PATIENT_DEID)
+
+manual_resp_sofa_patients = intersect(PaO2_patients,FiO2_patients)
+
+Respiratory_red= Respiratory_f%>%
+  filter(PATIENT_DEID %in% manual_resp_sofa_patients)%>%
+  group_by(PATIENT_DEID)%>%arrange(RECORDED_TIME_DEID)
+
+PaO2_over_FiO2 = Respiratory_red%>%mutate(FiO2_impute = na_locf(FiO2,option = "locf"))%>%filter(!is.na(PaO2))%>%
+  mutate(PaO2_over_FiO2 = PaO2/FiO2_impute)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_PaO2_over_FiO2_if_MV=min(PaO2_over_FiO2))
+```
+
+```{r}
+##minute ventilation*PaCO2 if MV
+RR=flowsheets_alt_add%>%filter(FLO_MEAS_NAME%in%c("R VENT RESP RATE OBSERVED",
+                                                  "R VENT RESPIRATORY RATE SET (CMV)",
+                                                  "RESPIRATIONS"))%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE, MV_start_time)%>%
+  mutate(RR = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  select(-MV_start_time)
+
+RR_patient=unique(RR$PATIENT_DEID)
+
+tidal_volume=flowsheets_alt_add%>%filter(FLO_MEAS_NAME=="R VENT TIDAL VOLUME OBSERVED")%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE, MV_start_time)%>%
+  mutate(TV = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  select(-MV_start_time)
+
+TV_patient=unique(tidal_volume$PATIENT_DEID)
+res=data.frame(PATIENT_DEID=c(),
+               time_mv=c(),
+               minute_ventilation=c())
+for (patient in intersect(RR_patient,TV_patient)){
+  time_RRTV=expand.grid((RR%>%
+                          filter(PATIENT_DEID==patient))$RECORDED_TIME_DEID,
+                        (tidal_volume%>%
+                          filter(PATIENT_DEID==patient))$RECORDED_TIME_DEID)
+  time_RRTV_diff=abs(difftime(time_RRTV$Var1,time_RRTV$Var2,units="mins"))
+  diff_time_RRTV=min(time_RRTV_diff)
+  ind_RRTV=which(time_RRTV_diff==diff_time_RRTV)
+  RRTV=expand.grid((RR%>%
+                      filter(PATIENT_DEID==patient))$RR,
+                   (tidal_volume%>%
+                          filter(PATIENT_DEID==patient))$TV)
+  ind_RRTV_2=which(((RRTV[ind_RRTV,]%>%
+                       mutate(minute_ventilation=Var1*Var2))$minute_ventilation)==max((RRTV[ind_RRTV,]%>%
+                                                                                         mutate(minute_ventilation=Var1*Var2))$minute_ventilation))
+  ind_RRTV_final=ind_RRTV[ind_RRTV_2]
+  time_mv=(time_RRTV[ind_RRTV_final,]%>%
+    mutate(MV_time=as.POSIXct((as.numeric(Var1)+as.numeric(Var2))/2, origin = '1970-01-01',tz="UTC")))$MV_time
+  minute_ventilation=(RRTV[ind_RRTV_final,]%>%
+    mutate(minute_ventilation=Var1*Var2))$minute_ventilation
+  res_p=data.frame(PATIENT_DEID=patient,
+                   time_mv=time_mv,
+                   minute_ventilation=minute_ventilation)%>%
+    distinct()
+  res=rbind(res,res_p)
+}
+Minute_Ventilation=res
+
+MV_patient=unique(Minute_Ventilation$PATIENT_DEID)
+
+PaCO2r=labs_add%>%filter(EXTERNAL_NAME=="pCO2, Arterial",
+                          PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,ORDER_INST_DEID, ORD_VALUE, MV_start_time)%>%
+  mutate(PaCO2 = as.numeric(str_extract(ORD_VALUE,"\\d+\\.*\\d*")))%>%
+  rename(RECORDED_TIME_DEID = ORDER_INST_DEID)%>%select(-ORD_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  select(-MV_start_time)
+
+PaCO2_patient=unique(PaCO2r$PATIENT_DEID)
+
+res=data.frame(PATIENT_DEID=c(),
+               minute_ventilation_PaCO2=c())
+
+for (patient in intersect(MV_patient,PaCO2_patient)){
+  time_MVPaCO2=expand.grid((Minute_Ventilation%>%
+                          filter(PATIENT_DEID==patient))$time_mv,
+                          (PaCO2r%>%
+                          filter(PATIENT_DEID==patient))$RECORDED_TIME_DEID)
+  time_MVPaCO2_diff=abs(difftime(time_MVPaCO2$Var1,time_MVPaCO2$Var2,units="mins"))
+  diff_time_MVPaCO2=min(time_MVPaCO2_diff)
+  ind_MVPaCO2=which(time_MVPaCO2_diff==diff_time_MVPaCO2)
+  MVPaCO2=expand.grid((Minute_Ventilation%>%
+                         filter(PATIENT_DEID==patient))$minute_ventilation,
+                      (PaCO2r%>%
+                         filter(PATIENT_DEID==patient))$PaCO2)
+  ind_MVPaCO2_2=which(((MVPaCO2[ind_MVPaCO2,]%>%
+                          mutate(minute_ventilation_PaCO2=Var1*Var2))$minute_ventilation_PaCO2)==max((MVPaCO2[ind_MVPaCO2,]%>%                                                                                                  mutate(minute_ventilation_PaCO2=Var1*Var2))$minute_ventilation_PaCO2))
+  ind_MVPaCO2_final=ind_MVPaCO2[ind_MVPaCO2_2]
+  minute_ventilation_PaCO2=(MVPaCO2[ind_MVPaCO2_final,]%>%
+    mutate(minute_ventilation_PaCO2=Var1*Var2))$minute_ventilation_PaCO2
+  res_p=data.frame(PATIENT_DEID=patient,
+                   minute_ventilation_PaCO2=minute_ventilation_PaCO2)%>%
+    distinct()
+  res=rbind(res,res_p)
+}
+MVPaCO2=res%>%
+  mutate(minute_ventilation_PaCO2_if_MV=minute_ventilation_PaCO2/1000)%>%
+  dplyr::select(-minute_ventilation_PaCO2)
+```
+
+```{r}
+#Combine all results together
+data_full=full_join(data_master,heart_rate%>%
+                      dplyr::select(-extreme_heart_rate_24h))%>%
+  full_join(Blood_pressure%>%
+              dplyr::select(-extreme_SBP_24h))%>%
+  full_join(Mean_arterial_pressure%>%
+              dplyr::select(-extreme_MAP_24h))%>%
+  full_join(temperature)%>%
+  full_join(PaO2)%>%
+  full_join(pH)%>%
+  full_join(PaCO2)%>%
+  full_join(bicarbonate)%>%
+  full_join(creatinine)%>%
+  full_join(blood_glucose)%>%
+  full_join(WBC)%>%
+  full_join(lactate)%>%
+  full_join(potassium)%>%
+  full_join(sodium)%>%
+  full_join(albumin%>%
+              dplyr::select(-extreme_albumin_24h))%>%
+  full_join(AST%>%
+              dplyr::select(-extreme_AST_24h))%>%
+  full_join(ALT%>%
+              dplyr::select(-extreme_ALT_24h))%>%
+  full_join(HGB)%>%
+  full_join(HCT)%>%
+  full_join(PLT)%>%
+  full_join(INR)%>%
+  full_join(PaO2_over_FiO2_24h)%>%
+  mutate(MeVe=ifelse(`MV @ 24 hours`!="none","Yes","No"))%>%
+  full_join(Fi02)%>%
+  full_join(PaO2_over_FiO2)%>%
+  full_join(MVPaCO2)%>%
+  mutate(`MV @ 24 hours`=ifelse(`MV @ 24 hours`=="before 24h","Yes","No"))
+master_table2<-read_csv("master_table_991patients_04_26_22.csv")%>%
+  dplyr::select(PATIENT_DEID,Death_at_discharge)
+data_full<-full_join(data_full,master_table2,by="PATIENT_DEID")%>%
+  filter(!is.na(Death_at_discharge))
+```
+
+```{r}
+##Deselect those variables not needed.
+data_full=data_full%>%
+  dplyr::select(-lowest_MAP_24h,-lowest_PaO2_24h,-extreme_PaCO2_24h,
+                -highest_AST_24h,-highest_ALT_24h,-highest_INR_24h,-highest_Fi02_24h_if_MV,
+                -lowest_PaO2_over_FiO2_if_MV,-minute_ventilation_PaCO2_if_MV,-MeVe)
+```
+
+```{r}
+##Change the variables into the format we need.
+data_full=data_full%>%
+  mutate(extreme_pH_24h=ifelse(is.na(extreme_pH_24h),NA,
+                               ifelse(extreme_pH_24h<7.2,"Abnormal_low",
+                                      ifelse(extreme_pH_24h>7.5,"Abnormal_high","Normal"))))%>%
+  mutate(lowest_SBP_24h=ifelse(is.na(lowest_SBP_24h),NA,
+                               ifelse(lowest_SBP_24h<90,"Abnormal_low","Normal")))%>%
+  mutate(lowest_PaO2_over_FiO2_24h=ifelse(is.na(lowest_PaO2_over_FiO2_24h),NA,
+                                          ifelse(lowest_PaO2_over_FiO2_24h<100,"Severe_ARDS",
+                                                 ifelse(lowest_PaO2_over_FiO2_24h<200,"Moderate_ARDS",
+                                                        ifelse(lowest_PaO2_over_FiO2_24h<300,"Mild_ARDS",
+                                                               "No_ARDS")))))
+```
+
+```{r}
+##Read the tables for SOFA score and APACHE II score
+patient_list=data_full$PATIENT_DEID
+SOFA=read.csv("SOFA_day_1_to_5_filling_na_1000.csv")%>%
+  dplyr::select(PATIENT_DEID,SOFA_1)%>%
+  rename(SOFA_24h=SOFA_1)
+data_full_filled=full_join(SOFA,data_full)%>%
+  filter(PATIENT_DEID%in%patient_list)%>%
+  rename(Age="Age @ ICU Admission",
+         ICU_Type="ICU Type",
+         MeVe_24h="MV @ 24 hours",
+         Fluid_balance_24h="Fluid Balance - Day 1 (L)",
+         Admission_Diagnosis="Admission Diagnosis, Broad Category")
+
+APACHE=read.csv("APACHE_II_first_7days.csv")%>%
+  filter(order_every_day==1)%>%
+  dplyr::select(PATIENT_DEID,APACHE_II_score)
+data_full_filled=full_join(APACHE,data_full_filled)%>%
+  rename(APACHE_24h=APACHE_II_score)
+```
+
+# Feature tables for UNC 1000 data set
+
+```{r echo=FALSE}
+suppressMessages(library("knitr"))
+suppressMessages(library("kableExtra"))
+```
+
+In the following table, we showcase missing proportions in each predictor.
+
+```{r}
+#List of variable names used in result table
+table.features.1=c("Age","Sex (Male)","MRC-ICU score at 24 hours",
+                 "ICU Type","Mechanical Ventilation at 24 hours","Fluid balance at 24 hours",
+                 "Admission Diagnosis",
+                 "CRRT at 24 hours","Vasopressor at 24 hours","Heart rate at 24 hours",
+                 "SBP at 24 hours","Temperature at 24 hours",
+                 "pH at 24 hours",
+                 "Bicarbonate at 24 hours","Creatinine at 24 hours","Blood glucose at 24 hours",
+                 "WBC at 24 hours","Lactate at 24 hours","Potassium at 24 hours",
+                 "Sodium at 24 hours","Albumin at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                 "PLT at 24 hours",
+                 "PaO2/FiO2 at 24 hours")
+
+number_missing=paste0(colSums(data_full_filled[,-c(1:3,29)]%>%is.na()),
+                      " (",round(colSums(data_full_filled[,-c(1:3,29)]%>%is.na())/991,4),")")
+names(number_missing)=table.features.1
+number_missing=as.matrix(number_missing)
+colnames(number_missing)="number (proportion) of missingness"
+
+kable(number_missing,caption = "Number (proportion) of missingness of Predictors in UNC 1000 data set",
+      align=rep("r",1))
+
+```
+
+```{r}
+#List of variable names used in result table
+table.features=c("APACHE II at 24 hours","SOFA at 24 hours",
+                 "Age","Sex (Male)","MRC-ICU score at 24 hours",
+                 "ICU Type-Mixed","ICU Type-Burn","ICU Type-Cardiac","ICU Type-Cardiothoracic Surgery",
+                 "ICU Type-Medical","ICU Type-Neurosciences","ICU Type-Surgical",
+                 "Mechanical Ventilation at 24 hours","Fluid balance at 24 hours",
+                 "Admission Diagnosis-Other","Admission Diagnosis-Burn",
+                 "Admission Diagnosis-Cardiovascular","Admission Diagnosis-Dermatology",
+                 "Admission Diagnosis-Electrolyte Abnormalities","Admission Diagnosis-Endocrine",
+                 "Admission Diagnosis-Fever","Admission Diagnosis-Gastrointestinal",
+                 "Admission Diagnosis-Hematologic","Admission Diagnosis-Hepatic",
+                 "Admission Diagnosis-Infection","Admission Diagnosis-Mental Health",
+                 "Admission Diagnosis-Neoplasm","Admission Diagnosis-Neurology",
+                 "Admission Diagnosis-Pneumonia","Admission Diagnosis-Pregnancy",
+                 "Admission Diagnosis-Pulmonary","Admission Diagnosis-Renal",
+                 "Admission Diagnosis-Respiratory","Admission Diagnosis-Respiratory Failure",
+                 "Admission Diagnosis-Sepsis","Admission Diagnosis-Shock",
+                 "Admission Diagnosis-Syncope","Admission Diagnosis-Toxicology/Ingestion",
+                 "Admission Diagnosis-Trauma","Admission Diagnosis-Weakness",
+                 "CRRT at 24 hours","Vasopressor at 24 hours","Heart rate at 24 hours",
+                 "SBP at 24 hours (Abnormal)","Temperature at 24 hours",
+                 "pH at 24 hours-Normal","pH at 24 hours-Abnormal low","pH at 24 hours-Abnormal high",
+                 "Bicarbonate at 24 hours","Creatinine at 24 hours","Blood glucose at 24 hours",
+                 "WBC at 24 hours","Lactate at 24 hours","Potassium at 24 hours",
+                 "Sodium at 24 hours","Albumin at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                 "PLT at 24 hours",
+                 "PaO2/FiO2 at 24 hours-No ARDS","PaO2/FiO2 at 24 hours-Mild ARDS",
+                 "PaO2/FiO2 at 24 hours-Moderate ARDS","PaO2/FiO2 at 24 hours-Severe ARDS")
+
+variable.features=names(data_full_filled)[-c(1,29)]
+
+#List of variable types
+types.feature=c("cont","cont","cont","ind","cont","cate","ind",
+                "cont","cate","ind","ind","cont","ind",
+                "cont","cate","cont","cont",
+                "cont","cont","cont","cont","cont",
+                "cont","cont","cont","cont","cate")
+
+##change the variables into the format we need.
+data_full_filled=data_full_filled%>%
+  mutate(Death_at_discharge=ifelse(Death_at_discharge=="alive","Alive","Death"),
+         Death_at_discharge=factor(Death_at_discharge,levels = c("Alive","Death")),
+         Sex=ifelse(Sex=="Male",TRUE,FALSE),
+         ICU_Type=relevel(factor(ICU_Type),ref="Mixed"),
+         MeVe_24h=ifelse(MeVe_24h=="Yes",TRUE,FALSE),
+         Admission_Diagnosis=relevel(factor(Admission_Diagnosis),ref="Other"),
+         CRRT_24h=ifelse(CRRT_24h=="Yes",TRUE,FALSE),
+         Vasopressor_24h=ifelse(Vasopressor_24h=="Yes",TRUE,FALSE),
+         lowest_SBP_24h=ifelse(lowest_SBP_24h=="Abnormal_low",TRUE,FALSE),
+         extreme_pH_24h=factor(extreme_pH_24h,levels=c("Normal","Abnormal_low","Abnormal_high")),
+         lowest_PaO2_over_FiO2_24h=factor(lowest_PaO2_over_FiO2_24h,levels=c("No_ARDS","Mild_ARDS",
+                                                                             "Moderate_ARDS",
+                                                                             "Severe_ARDS")),
+         Death_at_discharge=ifelse(Death_at_discharge=="Death",TRUE,FALSE)
+         )
+```
+
+```{r}
+#The following function is used to find the statistics needed for all variables.
+table1=function(datax,variables_data,variables_table,typesx){
+  results=c()
+  for (i in 1:length(typesx)){
+    vari=datax[,variables_data[i]]
+    if (typesx[i]=="ind"){
+      results=c(results,
+                paste(sum(vari,na.rm=T),
+                      " (",format(round(mean(vari,na.rm=T),4)*100,
+                                  scientific=FALSE,nsmall=2),"%)",
+                      sep=""
+                      )
+                )
+    }else if(typesx[i]=="cont"){
+      results=c(results,
+                paste(format(round(mean(vari,na.rm=T),2),scientific=FALSE,nsmall=2),
+                      " (",format(round(sd(vari,na.rm=T),2),
+                                  scientific=FALSE,nsmall=2),
+                      ")",sep=""
+                      )
+                )
+    }else{
+      results=c(results,paste(table(vari)," (",
+                              format(round(table(vari)/sum(table(vari)),4)*100,
+                                     scientific=FALSE,nsmall=2),"%)",sep=""
+                              )
+                )
+    }
+  }
+  results=matrix(results)
+  rownames(results)=variables_table
+  if (sum(datax$Death_at_discharge==T)==0){
+    colnames(results)=paste("Survived, n=",nrow(datax),sep="")
+  }else if(sum(datax$Death_at_discharge==T)==nrow(datax)){
+    colnames(results)=paste("Died, n=",nrow(datax),sep="")
+  }else{
+    colnames(results)=paste("Total Cohort, n=",nrow(datax),sep="")
+  }
+  return(results)
+}
+```
+
+```{r}
+#The following rows find the results of the feature statistics in mortality group, not mortality group, and whole data set
+
+## for all
+table.cohort=table1(data_full_filled,variable.features,table.features,types.feature)
+
+## for mortality
+data_full_filled.died=data_full_filled%>%filter(Death_at_discharge==T)
+table.died=table1(data_full_filled.died,variable.features,table.features,types.feature)
+## for not mortality
+data_full_filled.alive=data_full_filled%>%filter(Death_at_discharge==F)
+table.alive=table1(data_full_filled.alive,variable.features,table.features,types.feature)
+
+table.results=cbind(table.cohort,table.died,table.alive)
+```
+
+In the following table, the population characteristics are shown.
+
+```{r}
+#result is shown in the following table
+kable(table.results,caption = "Study population characteristics in UNC 1000 data set",
+      align=rep("r",3))
+```
+
+```{r}
+#The following function is used to compare different variables in mortality group and not mortality group
+#continuous variables are compared by t test.
+#categorical variables are compared by chi-square tests.
+table2=function(datax,variables_data,variables_table,typesx,colname){
+  results=c()
+  for (i in 1:length(typesx)){
+    data.use=na.omit(datax[,c("Death_at_discharge",variables_data[i])])
+    if (typesx[i]=="cate"){
+      var.tab=table(data.use[,1],data.use[,2])
+      var.chisq=chisq.test(var.tab)
+      results=rbind(results,
+                    c(format(round(var.chisq$statistic,2),
+                             scientific=FALSE,nsmall=2),
+                      var.chisq$parameter,
+                      format(round(var.chisq$p.value,2),
+                             scientific=FALSE,nsmall=2))
+                    )
+    }else if(typesx[i]=="cont"){
+      data.use.flu.0=data.use[data.use[,1]==0,2]
+      data.use.flu.1=data.use[data.use[,1]==1,2]
+      var.t=t.test(data.use.flu.1,data.use.flu.0)
+      results=rbind(results,
+                    c(format(round(var.t$statistic,2),
+                             scientific=FALSE,nsmall=2),
+                      format(round(var.t$parameter,2),
+                             scientific=FALSE,nsmall=2),
+                      format(round(var.t$p.value,2),
+                             scientific=FALSE,nsmall=2))
+                    )
+    }
+  }
+  rownames(results)=variables_table
+  colnames(results)=colname
+  return(results)
+}
+```
+
+In the following table, $t$ tests are conducted for continuous variables between different mortality levels.
+
+```{r warning=F}
+#List of variable names used in result table
+table.features.cont=c("APACHE II at 24 hours","SOFA at 24 hours",
+                 "Age","MRC-ICU score at 24 hours","Fluid balance at 24 hours",
+                 "Heart rate at 24 hours","Temperature at 24 hours",
+                 "Bicarbonate at 24 hours","Creatinine at 24 hours","Blood glucose at 24 hours",
+                 "WBC at 24 hours","Lactate at 24 hours","Potassium at 24 hours",
+                 "Sodium at 24 hours","Albumin at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                 "PLT at 24 hours")
+
+cont.id=which(types.feature=="cont")
+
+table2.cont=table2(data_full_filled,variable.features[cont.id],
+                   table.features.cont,
+                   types.feature[cont.id],c("t statistic","df","p value"))
+kable(table2.cont,caption = "t tests for continuous variables (Death-Survival) in UNC 1000 data set",
+      align=rep("r",3))
+```
+
+In the following table, $\chi^2$ tests are conducted for categorical variables between different mortality levels.
+
+```{r}
+data_full_filled=data_full_filled%>%mutate(ICU_Type=ifelse(as.character(ICU_Type)%in%c("Mixed","Cardiothoracic Surgery"),
+                                                                "merge",as.character(ICU_Type))
+                                           )
+
+table.features.cate=c("Sex","ICU Type",
+                      "Mechanical Ventilation at 24 hours","Admission Diagnosis",
+                      "CRRT at 24 hours","Vasopressor at 24 hours",
+                      "SBP at 24 hours","pH at 24 hours",
+                      "PaO2/FiO2 at 24 hours")
+
+types.feature[types.feature=="ind"]="cate"
+cate.id=which(types.feature=="cate")
+
+table2.cate=table2(data_full_filled,variable.features[cate.id],
+                   table.features.cate,
+                   types.feature[cate.id],c("Chi square statistic","df","p value"))
+
+kable(table2.cate,caption = "Chi square tests for categorical variables in UNC 1000 data set",
+      align=rep("r",3))
+```
+
+In the following cells, UNC 5000 data sets are read.
+
+```{r}
+ICU_stay_time_5000=read_csv("Master5000_final_0815.csv")%>%
+  dplyr::select(PATIENT_DEID, ICU_Start_Time, ICU_End_Time)%>%
+  rename(start=ICU_Start_Time,
+         end=ICU_End_Time)%>%
+  mutate(start=strptime(start,"%d%b%y:%H:%M:%S"),
+         end=strptime(end,"%d%b%y:%H:%M:%S"))
+
+flowsheets_alt_5000=read_csv("flowsheets.csv",
+                             col_types = cols(MEAS_VALUE = col_character()))
+
+flowsheets_alt_5000 = left_join(flowsheets_alt_5000,ICU_stay_time_5000)
+
+labs_5000=read_csv("labs5000.csv",
+              col_types = cols(PATIENT_DEID = col_character(),
+                               ENCOUNTER_DEID = col_character(),
+                               RESULT_DATE_DEID = col_datetime(format = ""),
+                               COMPONENT_ID = col_double(),
+                               NAME = col_character(),
+                               BASE_NAME = col_character(),
+                               EXTERNAL_NAME = col_character(),
+                               ORD_VALUE = col_character(),
+                               ABNORMAL_YN = col_character(),
+                               RESULT_FLAG_NAME = col_character(),
+                               DESCRIPTION = col_character(),
+                               SPECIMEN_TYPE_NAME = col_character(),
+                               LOINC = col_character(),
+                               REFERENCE_LOW = col_character(),
+                               REFERENCE_HIGH = col_character(),
+                               REFERENCE_UNIT = col_character()
+                               )
+              )
+labs_5000 = left_join(labs_5000,ICU_stay_time_5000,by = "PATIENT_DEID")
+```
+
+
+```{r}
+data_master_5000=read_csv("Master5000_final_0815.csv")%>%
+  rename(start=ICU_Start_Time,
+         end=ICU_End_Time)%>%
+  mutate(CRRT_start=strptime(start,"%d%b%y:%H:%M:%S"),
+         start=strptime(start,"%d%b%y:%H:%M:%S"),
+         end=strptime(end,"%d%b%y:%H:%M:%S"))%>%
+  mutate(CRRT_24h=ifelse(((difftime(CRRT_start,start,units="hours")<24)&
+                            (difftime(CRRT_start,start,units="hours")>=0)&
+                            (difftime(end,CRRT_start,units="hours")>=0)&
+                            CRRT_Duration>0),"Yes","No"))%>%
+  dplyr::select(PATIENT_DEID, AGE, SEX, score_24h, SOFA_1, 
+                Apache_1, Fluid_Balance_Day1, ICU_TYPE,
+                Vasopressor_taken_within_24h,CRRT_24h,
+                Death_Within_ICU)%>%
+  rename(Sex=SEX,
+         Age=AGE,
+         MRC_24h=score_24h,
+         SOFA_24h=SOFA_1,
+         APACHE_24h=Apache_1,
+         ICU_Type=ICU_TYPE,
+         Fluid_balance_24h=Fluid_Balance_Day1,
+         Vasopressor_24h=Vasopressor_taken_within_24h,
+         Death_at_discharge=Death_Within_ICU)%>%
+  mutate(CRRT_24h=ifelse(is.na(CRRT_24h),"No",CRRT_24h),
+         Death_at_discharge=ifelse(Death_at_discharge=="Yes","Death","alive"))
+
+data_master_MeVe_5000=read_csv("Master_MV_0815.csv")%>%
+  dplyr::select(PATIENT_DEID,MV_ICU,MV_24h)%>%
+  rename(MeVe=MV_ICU,
+         MeVe_24h=MV_24h)
+
+data_master_Ad_5000=read_excel("5000dataset_UNCadmissioncodes.xlsx",
+                               sheet="Sheet1",col_names=T,na="NA")%>%
+  dplyr::select(PATIENT_DEID,`UNC CODE`)%>%
+  rename(Admission_Diagnosis=`UNC CODE`)
+  
+
+data_master_5000=left_join(data_master_5000,data_master_Ad_5000)%>%
+  left_join(data_master_MeVe_5000)%>%
+  mutate(MeVe=ifelse(is.na(MeVe),"No",MeVe),
+         MeVe_24h=ifelse(is.na(MeVe_24h),"No",
+                         ifelse(MeVe_24h=="before 24h","Yes","No")))
+```
+
+Similar with what is done for UNC 1000 data, we also create those variables correspondingly.
+
+```{r}
+##Heart rate
+mid_hr=(60+90)/2
+heart_rate=flowsheets_alt_5000%>%
+  filter(FLO_MEAS_NAME=="PULSE",
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(heart_rate=as.numeric(str_extract(MEAS_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=heart_rate-mid_hr)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_heart_rate_24h = heart_rate[which.max(abs(dist_mid))],
+            highest_heart_rate_24h = max(heart_rate))
+
+mid_sbp=(100+160)/2
+Blood_pressure=flowsheets_alt_5000%>%
+  filter(FLO_MEAS_NAME=="BLOOD PRESSURE",
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(SBP=as.numeric(str_split(MEAS_VALUE, "/", simplify = TRUE)[,1]),
+         #DBP=as.numeric(str_split(MEAS_VALUE, "/", simplify = TRUE)[,2]),
+         dist_sbp_mid=SBP-mid_sbp
+         )%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_SBP_24h = SBP[which.max(abs(dist_sbp_mid))],
+            lowest_SBP_24h=min(SBP))
+
+#MAP
+mid_map=(65+100)/2
+Mean_arterial_pressure=flowsheets_alt_5000%>%
+  filter(FLO_MEAS_NAME%in%c("R MAP A-LINE","R MAP A-LINE 2","R MAP A-LINE 3"),
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(MAP=as.numeric(str_extract(MEAS_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=MAP-mid_map)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_MAP_24h = MAP[which.max(abs(dist_mid))],
+            lowest_MAP_24h = min(MAP))
+
+##Temperature
+mid_tem=(96.98+98.96)/2
+temperature=flowsheets_alt_5000%>%
+  filter(FLO_MEAS_NAME=="TEMPERATURE",
+         difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(!is.na(MEAS_VALUE))%>%
+  mutate(temperature=as.numeric(str_extract(MEAS_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=temperature-mid_tem)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_temperature_24h = temperature[which.max(abs(dist_mid))])
+
+##PaO2
+PaO2=labs_5000%>%filter(EXTERNAL_NAME=="pO2, Arterial",
+                   difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                   difftime(ORDER_INST_DEID,start,units="hours")<24,
+                   difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(lowest_PaO2_24h = min(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+
+##pH
+mid_pH=(7.35+7.45)/2
+pH=labs_5000%>%filter(EXTERNAL_NAME=="pH, Arterial",
+                 difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                 difftime(ORDER_INST_DEID,start,units="hours")<24,
+                 difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(pH=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=pH-mid_pH)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_pH_24h = pH[which.max(abs(dist_mid))])
+
+##PaCO2
+mid_PaCO2=(35+45)/2
+PaCO2=labs_5000%>%filter(EXTERNAL_NAME=="pCO2, Arterial",
+                   difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                   difftime(ORDER_INST_DEID,start,units="hours")<24,
+                   difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(PaCO2=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=PaCO2-mid_PaCO2)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_PaCO2_24h = PaCO2[which.max(abs(dist_mid))])
+
+##Bicarbonate
+mid_bicarbonate=(22+26)/2
+bicarbonate=labs_5000%>%filter(EXTERNAL_NAME=="CO2",
+                          difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                          difftime(ORDER_INST_DEID,start,units="hours")<24,
+                          difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(bicarbonate=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=bicarbonate-mid_bicarbonate)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_bicarbonate_24h = bicarbonate[which.max(abs(dist_mid))])
+
+##Creatinine
+creatinine=labs_5000%>%filter(EXTERNAL_NAME=="Creatinine",
+                          difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                          difftime(ORDER_INST_DEID,start,units="hours")<24,
+                          difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(highest_creatinine_24h = max(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+
+##Blood glucose
+mid_bg=(70+180)/2
+blood_glucose=labs_5000%>%filter(EXTERNAL_NAME%in%c("Glucose","Glucose, POC"),
+                            difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                            difftime(ORDER_INST_DEID,start,units="hours")<24,
+                            difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(blood_glucose=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=blood_glucose-mid_bg)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_blood_glucose_24h = blood_glucose[which.max(abs(dist_mid))])
+
+##WBC
+mid_wbc=(4.5+11)/2
+WBC=labs_5000%>%filter(EXTERNAL_NAME=="WBC",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(WBC=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=WBC-mid_wbc)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(extreme_WBC_24h = WBC[which.max(abs(dist_mid))])
+
+##Lactate
+lactate=labs_5000%>%filter(BASE_NAME=="LACTATE",
+                      difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                      difftime(ORDER_INST_DEID,start,units="hours")<24,
+                      difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(highest_lactate_24h = max(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+
+##Potassium
+mid_pot=(3.5+5.2)/2
+potassium=labs_5000%>%filter(NAME=="POTASSIUM",
+                        difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                        difftime(ORDER_INST_DEID,start,units="hours")<24,
+                        difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(potassium=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=potassium-mid_pot)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_potassium_24h = potassium[which.max(abs(dist_mid))])
+
+##Sodium
+mid_sod=(135+145)/2
+sodium=labs_5000%>%filter(NAME=="SODIUM",
+                     difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                     difftime(ORDER_INST_DEID,start,units="hours")<24,
+                     difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(sodium=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=sodium-mid_sod)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_sodium_24h = sodium[which.max(abs(dist_mid))])
+
+##Albumin
+mid_alb=(3.5+5.4)/2
+albumin=labs_5000%>%filter(NAME=="ALBUMIN",
+                     difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                     difftime(ORDER_INST_DEID,start,units="hours")<24,
+                     difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(albumin=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=albumin-mid_alb)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_albumin_24h = albumin[which.max(abs(dist_mid))],
+            lowest_albumin_24h = min(albumin))
+
+##AST
+mid_AST=(8+33)/2
+AST=labs_5000%>%filter(EXTERNAL_NAME=="AST",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(AST=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=AST-mid_AST)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_AST_24h = AST[which.max(abs(dist_mid))],
+            highest_AST_24h = max(AST))
+
+##ALT
+mid_ALT=(4+36)/2
+ALT=labs_5000%>%filter(EXTERNAL_NAME=="ALT",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(ALT=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=ALT-mid_ALT)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_ALT_24h = ALT[which.max(abs(dist_mid))],
+            highest_ALT_24h = max(ALT))
+
+##HGB
+HGB=labs_5000%>%filter(EXTERNAL_NAME=="HGB",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_HGB_24h = min(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+
+##HCT
+HCT=labs_5000%>%filter(EXTERNAL_NAME=="HCT",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_HCT_24h = min(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+
+##PLT
+mid_PLT=(150+450)/2
+PLT=labs_5000%>%filter(grepl("PLATELET",NAME),
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  mutate(PLT=as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),
+         dist_mid=PLT-mid_PLT)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(extreme_PLT_24h = PLT[which.max(abs(dist_mid))])
+
+##INR
+INR=labs_5000%>%filter(EXTERNAL_NAME=="INR",
+                  difftime(ORDER_INST_DEID,start,units="hours")>=0,
+                  difftime(ORDER_INST_DEID,start,units="hours")<24,
+                  difftime(end,ORDER_INST_DEID,units="hours")>=0)%>%
+  filter(!is.na(ORD_VALUE))%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(highest_INR_24h = max(as.numeric(str_extract(ORD_VALUE, "\\d+\\.*\\d*")),na.rm=T))
+
+##PaO2/FiO2
+PaO2r = labs_5000%>%filter(EXTERNAL_NAME=="pO2, Arterial")%>%
+  select(PATIENT_DEID,ORDER_INST_DEID, ORD_VALUE, start, end)%>%
+  mutate(PaO2 = as.numeric(str_extract(ORD_VALUE,"\\d+\\.*\\d*")))%>%
+  rename(RECORDED_TIME_DEID = ORDER_INST_DEID)%>%select(-ORD_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)
+
+FiO2r = flowsheets_alt_5000%>%filter(DISP_NAME=="FiO2 (%)")%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE, start, end)%>%
+  mutate(FiO2 = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  mutate(FiO2 = ifelse(FiO2>1, ifelse(FiO2>=10,FiO2/100, FiO2/10), FiO2))%>%
+  filter(difftime(RECORDED_TIME_DEID,start,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,start,units="hours")<24,
+         difftime(end,RECORDED_TIME_DEID,units="hours")>=0)%>%
+  filter(FiO2!=0)
+
+Respiratory_f = full_join(FiO2r,PaO2r)%>%group_by(PATIENT_DEID)
+
+PaO2_patients = unique(PaO2r$PATIENT_DEID)
+FiO2_patients = unique(FiO2r$PATIENT_DEID)
+
+manual_resp_sofa_patients = intersect(PaO2_patients,FiO2_patients)
+
+Respiratory_red= Respiratory_f%>%
+  filter(PATIENT_DEID %in% manual_resp_sofa_patients)%>%
+  group_by(PATIENT_DEID)%>%arrange(RECORDED_TIME_DEID)
+
+PaO2_over_FiO2_24h = Respiratory_red%>%mutate(FiO2_impute = na_locf(FiO2,option = "locf"))%>%filter(!is.na(PaO2))%>%
+  mutate(PaO2_over_FiO2 = PaO2/FiO2_impute)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_PaO2_over_FiO2_24h=min(PaO2_over_FiO2))
+
+##Fi02 if MV
+MV_list=(data_master_5000%>%
+           filter(MeVe=="Yes"))$PATIENT_DEID
+MV=flowsheets_alt_5000%>%
+  filter(str_detect(MEAS_VALUE,"Ventilator"))%>%
+  group_by(PATIENT_DEID)%>%
+  filter(length(PATIENT_DEID)>1,
+         PATIENT_DEID%in%MV_list)%>%
+  summarise(MV_start_time=min(RECORDED_TIME_DEID))
+
+flowsheets_alt_5000_add=left_join(flowsheets_alt_5000,MV)
+Fi02=flowsheets_alt_5000_add%>%filter(DISP_NAME=="FiO2 (%)",
+                                 PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE,MV_start_time)%>%
+  mutate(FiO2 = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  mutate(FiO2 = ifelse(FiO2>1, ifelse(FiO2>=10,FiO2/100, FiO2/10), FiO2))%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  group_by(PATIENT_DEID)%>% 
+  summarise(highest_Fi02_24h_if_MV = max(FiO2,na.rm=T))
+
+##PaO2/FiO2 if MV
+labs_5000_add=left_join(labs_5000,MV)
+PaO2r = labs_5000_add%>%filter(EXTERNAL_NAME=="pO2, Arterial",
+                          PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,ORDER_INST_DEID, ORD_VALUE, MV_start_time)%>%
+  mutate(PaO2 = as.numeric(str_extract(ORD_VALUE,"\\d+\\.*\\d*")))%>%
+  rename(RECORDED_TIME_DEID = ORDER_INST_DEID)%>%select(-ORD_VALUE)%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)
+
+FiO2r = flowsheets_alt_5000_add%>%filter(DISP_NAME=="FiO2 (%)",
+                                    PATIENT_DEID%in%MV_list)%>%
+  select(PATIENT_DEID,RECORDED_TIME_DEID, MEAS_VALUE, MV_start_time)%>%
+  mutate(FiO2 = as.numeric(MEAS_VALUE))%>%select(-MEAS_VALUE)%>%
+  mutate(FiO2 = ifelse(FiO2>1, ifelse(FiO2>=10,FiO2/100, FiO2/10), FiO2))%>%
+  filter(difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")>=0,
+         difftime(RECORDED_TIME_DEID,MV_start_time,units="hours")<24)%>%
+  filter(FiO2!=0)
+
+Respiratory_f = full_join(FiO2r,PaO2r)%>%group_by(PATIENT_DEID)
+
+PaO2_patients = unique(PaO2r$PATIENT_DEID)
+FiO2_patients = unique(FiO2r$PATIENT_DEID)
+
+manual_resp_sofa_patients = intersect(PaO2_patients,FiO2_patients)
+
+Respiratory_red= Respiratory_f%>%
+  filter(PATIENT_DEID %in% manual_resp_sofa_patients)%>%
+  group_by(PATIENT_DEID)%>%arrange(RECORDED_TIME_DEID)
+
+PaO2_over_FiO2 = Respiratory_red%>%mutate(FiO2_impute = na_locf(FiO2,option = "locf"))%>%filter(!is.na(PaO2))%>%
+  mutate(PaO2_over_FiO2 = PaO2/FiO2_impute)%>%
+  group_by(PATIENT_DEID)%>%
+  summarise(lowest_PaO2_over_FiO2_if_MV=min(PaO2_over_FiO2))
+```
+
+```{r}
+##Combine all variables together
+data_full=full_join(data_master_5000,heart_rate%>%
+                      dplyr::select(-extreme_heart_rate_24h))%>%
+  full_join(Blood_pressure%>%
+              dplyr::select(-extreme_SBP_24h))%>%
+  full_join(Mean_arterial_pressure%>%
+              dplyr::select(-extreme_MAP_24h))%>%
+  full_join(temperature)%>%
+  full_join(PaO2)%>%
+  full_join(pH)%>%
+  full_join(PaCO2)%>%
+  full_join(bicarbonate)%>%
+  full_join(creatinine)%>%
+  full_join(blood_glucose)%>%
+  full_join(WBC)%>%
+  full_join(lactate)%>%
+  full_join(potassium)%>%
+  full_join(sodium)%>%
+  full_join(albumin%>%
+              dplyr::select(-extreme_albumin_24h))%>%
+  full_join(AST%>%
+              dplyr::select(-extreme_AST_24h))%>%
+  full_join(ALT%>%
+              dplyr::select(-extreme_ALT_24h))%>%
+  full_join(HGB)%>%
+  full_join(HCT)%>%
+  full_join(PLT)%>%
+  full_join(INR)%>%
+  full_join(PaO2_over_FiO2_24h)%>%
+  full_join(Fi02)%>%
+  full_join(PaO2_over_FiO2)
+```
+
+```{r}
+##remove some variables that are not needed.
+data_full=data_full%>%
+  filter(!is.na(Age))%>%
+  dplyr::select(-lowest_MAP_24h,-lowest_PaO2_24h,-extreme_PaCO2_24h,
+                -highest_AST_24h,-highest_ALT_24h,-highest_INR_24h,-highest_Fi02_24h_if_MV,
+                -lowest_PaO2_over_FiO2_if_MV,-MeVe)
+```
+
+```{r}
+##Modify variables to the format as needed.
+data_full=data_full%>%
+  mutate(extreme_pH_24h=ifelse(is.na(extreme_pH_24h),NA,
+                               ifelse(extreme_pH_24h<7.2,"Abnormal_low",
+                                      ifelse(extreme_pH_24h>7.5,"Abnormal_high","Normal"))))%>%
+  mutate(lowest_SBP_24h=ifelse(is.na(lowest_SBP_24h),NA,
+                               ifelse(lowest_SBP_24h<90,"Abnormal_low","Normal")))%>%
+  mutate(lowest_PaO2_over_FiO2_24h=ifelse(is.na(lowest_PaO2_over_FiO2_24h),NA,
+                                          ifelse(lowest_PaO2_over_FiO2_24h<100,"Severe_ARDS",
+                                                 ifelse(lowest_PaO2_over_FiO2_24h<200,"Moderate_ARDS",
+                                                        ifelse(lowest_PaO2_over_FiO2_24h<300,"Mild_ARDS",
+                                                               "No_ARDS")))))
+
+data_full_filled_5000=data_full[,names(data_full_filled)]%>%
+  filter(!PATIENT_DEID%in%data_full_filled$PATIENT_DEID)
+
+mapICU <- data.frame(old=c("Medical","Cardiac","Surgery","Burn","Cardiot","Neurosc","No pedi"),
+                     new=c("Medical","Cardiac","Surgical","Burn","Cardiothoracic Surgery","Neurosciences","Mixed"))
+
+data_full_filled_5000=data_full_filled_5000%>%
+  mutate(ICU_Type=mapICU$new[match(data_full_filled_5000$ICU_Type,mapICU$old)],
+         ICU_Type=relevel(factor(ICU_Type),ref="Mixed"))
+```
+
+# Feature tables for UNC 5000 data set
+
+In the following table, we showcase missing proportions in each predictor.
+
+```{r}
+#List of variable names used in result table
+table.features.1=c("Age","Sex (Male)","MRC-ICU score at 24 hours",
+                 "ICU Type","Mechanical Ventilation at 24 hours","Fluid balance at 24 hours",
+                 "Admission Diagnosis",
+                 "CRRT at 24 hours","Vasopressor at 24 hours","Heart rate at 24 hours",
+                 "SBP at 24 hours","Temperature at 24 hours",
+                 "pH at 24 hours",
+                 "Bicarbonate at 24 hours","Creatinine at 24 hours","Blood glucose at 24 hours",
+                 "WBC at 24 hours","Lactate at 24 hours","Potassium at 24 hours",
+                 "Sodium at 24 hours","Albumin at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                 "PLT at 24 hours",
+                 "PaO2/FiO2 at 24 hours")
+
+number_missing=paste0(colSums(data_full_filled_5000[,-c(1:3,29)]%>%is.na()),
+                      " (",format(round(colSums(data_full_filled_5000[,-c(1:3,29)]%>%is.na())/nrow(data_full_filled_5000),4),
+                                  scientific=FALSE,nsmall=4),")")
+names(number_missing)=table.features.1
+number_missing=as.matrix(number_missing)
+colnames(number_missing)="number (proportion) of missingness"
+
+kable(number_missing,caption = "Number (proportion) of missingness of Predictors in UNC 5000 data set",
+      align=rep("r",1))
+```
+
+```{r}
+#List of variable names used in result table
+table.features5000=c("APACHE II at 24 hours","SOFA at 24 hours",
+                 "Age","Sex (Male)","MRC-ICU score at 24 hours",
+                 "ICU Type-Mixed","ICU Type-Burn","ICU Type-Cardiac","ICU Type-Cardiothoracic Surgery",
+                 "ICU Type-Medical","ICU Type-Neurosciences","ICU Type-Surgical",
+                 "Mechanical Ventilation at 24 hours","Fluid balance at 24 hours",
+                 "Admission Diagnosis-Other","Admission Diagnosis-Burn",
+                 "Admission Diagnosis-Cardiovascular","Admission Diagnosis-Dermatology",
+                 "Admission Diagnosis-Electrolyte Abnormalities","Admission Diagnosis-Endocrine",
+                 "Admission Diagnosis-Fever","Admission Diagnosis-Gastrointestinal",
+                 "Admission Diagnosis-Hematologic","Admission Diagnosis-Hepatic",
+                 "Admission Diagnosis-Infection","Admission Diagnosis-Mental Health",
+                 "Admission Diagnosis-Neoplasm","Admission Diagnosis-Neurology",
+                 "Admission Diagnosis-Pneumonia","Admission Diagnosis-Pregnancy",
+                 "Admission Diagnosis-Pulmonary","Admission Diagnosis-Renal",
+                 "Admission Diagnosis-Respiratory","Admission Diagnosis-Respiratory Failure",
+                 "Admission Diagnosis-Sepsis","Admission Diagnosis-Shock",
+                 "Admission Diagnosis-Syncope","Admission Diagnosis-Toxicology/Ingestion",
+                 "Admission Diagnosis-Trauma","Admission Diagnosis-Weakness",
+                 "CRRT at 24 hours","Vasopressor at 24 hours","Heart rate at 24 hours",
+                 "SBP at 24 hours (Abnormal)","Temperature at 24 hours",
+                 "pH at 24 hours-Normal","pH at 24 hours-Abnormal low","pH at 24 hours-Abnormal high",
+                 "Bicarbonate at 24 hours","Creatinine at 24 hours","Blood glucose at 24 hours",
+                 "WBC at 24 hours","Lactate at 24 hours","Potassium at 24 hours",
+                 "Sodium at 24 hours","Albumin at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                 "PLT at 24 hours",
+                 "PaO2/FiO2 at 24 hours-No ARDS","PaO2/FiO2 at 24 hours-Mild ARDS",
+                 "PaO2/FiO2 at 24 hours-Moderate ARDS","PaO2/FiO2 at 24 hours-Severe ARDS")
+
+variable.features=names(data_full_filled_5000)[-c(1,29)]
+
+#List of variable types
+types.feature=c("cont","cont","cont","ind","cont","cate","ind",
+                "cont","cate","ind","ind","cont","ind",
+                "cont","cate","cont","cont",
+                "cont","cont","cont","cont","cont",
+                "cont","cont","cont","cont","cate")
+
+##modify variables to the format as we need
+data_full_filled_5000=data_full_filled_5000%>%
+  mutate(Death_at_discharge=ifelse(Death_at_discharge=="alive","Alive","Death"),
+         Death_at_discharge=factor(Death_at_discharge,levels = c("Alive","Death")),
+         Sex=ifelse(Sex=="Male",TRUE,FALSE),
+         ICU_Type=relevel(factor(ICU_Type),ref="Mixed"),
+         MeVe_24h=ifelse(MeVe_24h=="Yes",TRUE,FALSE),
+         Admission_Diagnosis=relevel(factor(Admission_Diagnosis),ref="Other"),
+         CRRT_24h=ifelse(CRRT_24h=="Yes",TRUE,FALSE),
+         Vasopressor_24h=ifelse(Vasopressor_24h=="Yes",TRUE,FALSE),
+         lowest_SBP_24h=ifelse(lowest_SBP_24h=="Abnormal_low",TRUE,FALSE),
+         extreme_pH_24h=factor(extreme_pH_24h,levels=c("Normal","Abnormal_low","Abnormal_high")),
+         lowest_PaO2_over_FiO2_24h=factor(lowest_PaO2_over_FiO2_24h,levels=c("No_ARDS","Mild_ARDS",
+                                                                             "Moderate_ARDS",
+                                                                             "Severe_ARDS")),
+         Death_at_discharge=ifelse(Death_at_discharge=="Death",TRUE,FALSE)
+         )
+```
+
+```{r}
+#The following function is used to find the statistics needed for all variables in UNC5000 data set.
+table3=function(datax,variables_data,variables_table,typesx){
+  results=c()
+  for (i in 1:length(typesx)){
+    vari=unlist(datax[,variables_data[i]])
+    if (typesx[i]=="ind"){
+      results=c(results,
+                paste(sum(vari,na.rm=T),
+                      " (",format(round(mean(vari,na.rm=T),4)*100,
+                                  scientific=FALSE,nsmall=2),"%)",
+                      sep=""
+                      )
+                )
+    }else if(typesx[i]=="cont"){
+      results=c(results,
+                paste(format(round(mean(vari,na.rm=T),2),scientific=FALSE,nsmall=2),
+                      " (",format(round(sd(vari,na.rm=T),2),
+                                  scientific=FALSE,nsmall=2),
+                      ")",sep=""
+                      )
+                )
+    }else{
+      results=c(results,paste(table(vari)," (",
+                              format(round(table(vari)/sum(table(vari)),4)*100,
+                                     scientific=FALSE,nsmall=2),"%)",sep=""
+                              )
+                )
+    }
+  }
+  results=matrix(results)
+  rownames(results)=variables_table
+  if (sum(datax$Death_at_discharge==T)==0){
+    colnames(results)=paste("Survived, n=",nrow(datax),sep="")
+  }else if(sum(datax$Death_at_discharge==T)==nrow(datax)){
+    colnames(results)=paste("Died, n=",nrow(datax),sep="")
+  }else{
+    colnames(results)=paste("Total Cohort, n=",nrow(datax),sep="")
+  }
+  return(results)
+}
+```
+
+```{r}
+#The following rows find the results of the feature statistics in mortality group, not mortality group, and whole data set
+
+## for all
+table.cohort=table3(data_full_filled_5000,variable.features,table.features5000,types.feature)
+
+## for mortality group
+data_full_filled_5000.died=data_full_filled_5000%>%filter(Death_at_discharge==T)
+table.died=table3(data_full_filled_5000.died,variable.features,table.features5000,types.feature)
+
+## for not mortality group
+data_full_filled_5000.alive=data_full_filled_5000%>%filter(Death_at_discharge==F)
+table.alive=table3(data_full_filled_5000.alive,variable.features,table.features5000,types.feature)
+
+table.results=cbind(table.cohort,table.died,table.alive)
+```
+
+In the following table, the population characteristics are shown.
+
+```{r}
+kable(table.results,caption = "Study population characteristics in UNC 5000 data set",
+      align=rep("r",3))
+```
+
+```{r}
+#The following function is used to compare different variables in mortality group and not mortality group
+#continuous variables are compared by t test.
+#categorical variables are compared by chi-square tests.
+table4=function(datax,variables_data,variables_table,typesx,colname){
+  results=c()
+  for (i in 1:length(typesx)){
+    data.use=na.omit(datax[,c("Death_at_discharge",variables_data[i])])
+    if (typesx[i]=="cate"){
+      var.tab=table(unlist(data.use[,1]),unlist(data.use[,2]))
+      var.chisq=chisq.test(var.tab)
+      results=rbind(results,
+                    c(format(round(var.chisq$statistic,2),
+                             scientific=FALSE,nsmall=2),
+                      var.chisq$parameter,
+                      format(round(var.chisq$p.value,2),
+                             scientific=FALSE,nsmall=2))
+                    )
+    }else if(typesx[i]=="cont"){
+      data.use.flu.0=data.use[data.use[,1]==0,2]
+      data.use.flu.1=data.use[data.use[,1]==1,2]
+      var.t=t.test(data.use.flu.1,data.use.flu.0)
+      results=rbind(results,
+                    c(format(round(var.t$statistic,2),
+                             scientific=FALSE,nsmall=2),
+                      format(round(var.t$parameter,2),
+                             scientific=FALSE,nsmall=2),
+                      format(round(var.t$p.value,2),
+                             scientific=FALSE,nsmall=2))
+                    )
+    }
+  }
+  rownames(results)=variables_table
+  colnames(results)=colname
+  return(results)
+}
+```
+
+In the following table, $t$ tests are conducted for continuous variables between different mortality levels.
+
+```{r warning=F}
+#List of variable names used in result table
+table.features.cont=c("APACHE II at 24 hours","SOFA at 24 hours",
+                 "Age","MRC-ICU score at 24 hours","Fluid balance at 24 hours",
+                 "Heart rate at 24 hours","Temperature at 24 hours",
+                 "Bicarbonate at 24 hours","Creatinine at 24 hours","Blood glucose at 24 hours",
+                 "WBC at 24 hours","Lactate at 24 hours","Potassium at 24 hours",
+                 "Sodium at 24 hours","Albumin at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                 "PLT at 24 hours")
+
+cont.id=which(types.feature=="cont")
+
+table2.cont=table4(data_full_filled_5000,variable.features[cont.id],
+                   table.features.cont,
+                   types.feature[cont.id],c("t statistic","df","p value"))
+kable(table2.cont,caption = "t tests for continuous variables (Death-Survival) in UNC 5000 data set",
+      align=rep("r",3))
+```
+
+In the following table, $\chi^2$ tests are conducted for categorical variables between different mortality levels.
+
+```{r}
+data_full_filled_5000=data_full_filled_5000%>%mutate(ICU_Type=ifelse(as.character(ICU_Type)%in%c("Mixed","Cardiothoracic Surgery"),
+                                                                "merge",as.character(ICU_Type))
+                                           )
+
+#List of variable names used in result table
+table.features.cate=c("Sex","ICU Type",
+                      "Mechanical Ventilation at 24 hours","Admission Diagnosis",
+                      "CRRT at 24 hours","Vasopressor at 24 hours",
+                      "SBP at 24 hours","pH at 24 hours",
+                      "PaO2/FiO2 at 24 hours")
+
+types.feature[types.feature=="ind"]="cate"
+cate.id=which(types.feature=="cate")
+
+table2.cate=table4(data_full_filled_5000,variable.features[cate.id],
+                   table.features.cate,
+                   types.feature[cate.id],c("Chi square statistic","df","p value"))
+
+kable(table2.cate,caption = "Chi square tests for categorical variables in UNC 5000 data set",
+      align=rep("r",3))
+```

@@ -1,0 +1,1243 @@
+---
+title: "Mortality Model Performance with Validation"
+author: "Author: Tianyi Zhang, the University of Georgia"
+date: "2024-01-10"
+output:
+  bookdown::html_document2:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F)
+```
+
+```{r}
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyverse"))
+suppressMessages(library("gam"))
+suppressMessages(library("MLeval"))
+suppressMessages(library("knitr"))
+suppressMessages(library("groupdata2"))
+suppressMessages(library("randomForest"))
+suppressMessages(library("caret"))
+suppressMessages(library("e1071"))
+suppressMessages(library("xgboost"))
+suppressMessages(library("epiR"))
+```
+
+```{r}
+data_full_filled = read.csv("mortality_data_preprocessed.csv")
+data_full_filled_5000 = read.csv("mortality_data_preprocessed_5000.csv")
+```
+
+In the following cell, we modify the variables to the format we need.
+
+```{r}
+data_full_filled=data_full_filled%>%
+  mutate(Death_at_discharge=ifelse(Death_at_discharge=="alive","Alive","Death"),
+         Death_at_discharge=factor(Death_at_discharge,levels = c("Alive","Death")),
+         Sex=factor(Sex,levels=c("Female", "Male")),
+         ICU_Type=relevel(factor(ICU_Type),ref="Mixed"),
+         MeVe_24h=factor(MeVe_24h,levels=c("No","Yes")),
+         Admission_Diagnosis=relevel(factor(Admission_Diagnosis),ref="Other"),
+         CRRT_24h=factor(CRRT_24h,levels=c("No","Yes")),
+         Vasopressor_24h=factor(Vasopressor_24h,levels=c("No","Yes")),
+         ind_miss_Fluid_balance_24h=factor(ind_miss_Fluid_balance_24h,levels=c("No","Yes")),
+         ind_miss_heart_rate_24h=factor(ind_miss_heart_rate_24h,levels=c("No","Yes")),
+         ind_miss_SBP_24h=factor(ind_miss_SBP_24h,levels=c("No","Normal_Vasso","Abnormal_low_Vasso")),
+         lowest_SBP_24h=factor(lowest_SBP_24h,levels=c("Normal","Abnormal_low")),
+         ind_miss_temperature_24h=factor(ind_miss_temperature_24h,levels=c("No","Yes")),
+         ind_miss_pH_24h=factor(ind_miss_pH_24h,levels=c("No","Yes")),
+         extreme_pH_24h=factor(extreme_pH_24h,levels=c("Normal","Abnormal_low","Abnormal_high")),
+         ind_miss_bicarbonate_24h=factor(ind_miss_bicarbonate_24h,levels=c("No","Yes")),
+         ind_miss_creatinine_24h=factor(ind_miss_creatinine_24h,levels=c("No","Yes")),
+         ind_miss_blood_glucose_24h=factor(ind_miss_blood_glucose_24h,levels=c("No","Yes")),
+         ind_miss_WBC_24h=factor(ind_miss_WBC_24h,levels=c("No","Yes")),
+         ind_miss_lactate_24h=factor(ind_miss_lactate_24h,levels=c("No","Yes")),
+         ind_miss_potassium_24h=factor(ind_miss_potassium_24h,levels=c("No","Yes")),
+         ind_miss_sodium_24h=factor(ind_miss_sodium_24h,levels=c("No","Yes")),
+         ind_miss_albumin_24h=factor(ind_miss_albumin_24h,levels=c("No","Yes")),
+         ind_miss_HGB_24h=factor(ind_miss_HGB_24h,levels=c("No","Yes_Female","Yes_Male")),
+         ind_miss_HCT_24h=factor(ind_miss_HCT_24h,levels=c("No","Yes_Female","Yes_Male")),
+         ind_miss_PLT_24h=factor(ind_miss_PLT_24h,levels=c("No","Yes")),
+         ind_miss_PaO2_over_FiO2_24h=factor(ind_miss_PaO2_over_FiO2_24h,levels=c("No","Yes")),
+         lowest_PaO2_over_FiO2_24h=factor(lowest_PaO2_over_FiO2_24h,levels=c("No_ARDS","Mild_ARDS",
+                                                                             "Moderate_ARDS",
+                                                                             "Severe_ARDS")),
+         MeVe=factor(MeVe,levels=c("No","Yes"))
+         )%>%
+  rename(ind_miss_HGB_HCT_24h=ind_miss_HGB_24h,
+         ind_miss_bicarbonate_creatinine_sodium_24h=ind_miss_bicarbonate_24h)%>%
+  dplyr::select(-ind_miss_HCT_24h,-ind_miss_creatinine_24h,
+                -ind_miss_sodium_24h)
+
+mapICU <- data.frame(old=c("Medical","Cardiac","Surgery","Burn","Cardiot","Neurosc","No pedi"),
+                     new=c("Medical","Cardiac","Surgical","Burn","Cardiothoracic Surgery","Neurosciences","Mixed"))
+
+data_full_filled_5000=data_full_filled_5000%>%
+  mutate(Death_at_discharge=ifelse(Death_at_discharge=="alive","Alive","Death"),
+         Death_at_discharge=factor(Death_at_discharge,levels = c("Alive","Death")),
+         Sex=factor(Sex,levels=c("Female", "Male")),
+         ICU_Type=mapICU$new[match(data_full_filled_5000$ICU_Type,mapICU$old)],
+         ICU_Type=relevel(factor(ICU_Type),ref="Mixed"),
+         MeVe_24h=factor(MeVe_24h,levels=c("No","Yes")),
+         Admission_Diagnosis=relevel(factor(Admission_Diagnosis),ref="Other"),
+         CRRT_24h=factor(CRRT_24h,levels=c("No","Yes")),
+         Vasopressor_24h=factor(Vasopressor_24h,levels=c("No","Yes")),
+         ind_miss_Fluid_balance_24h=factor(ind_miss_Fluid_balance_24h,levels=c("No","Yes")),
+         ind_miss_heart_rate_24h=factor(ind_miss_heart_rate_24h,levels=c("No","Yes")),
+         ind_miss_SBP_24h=factor(ind_miss_SBP_24h,levels=c("No","Normal_Vasso","Abnormal_low_Vasso")),
+         lowest_SBP_24h=factor(lowest_SBP_24h,levels=c("Normal","Abnormal_low")),
+         ind_miss_temperature_24h=factor(ind_miss_temperature_24h,levels=c("No","Yes")),
+         ind_miss_pH_24h=factor(ind_miss_pH_24h,levels=c("No","Yes")),
+         extreme_pH_24h=factor(extreme_pH_24h,levels=c("Normal","Abnormal_low","Abnormal_high")),
+         ind_miss_bicarbonate_24h=factor(ind_miss_bicarbonate_24h,levels=c("No","Yes")),
+         ind_miss_creatinine_24h=factor(ind_miss_creatinine_24h,levels=c("No","Yes")),
+         ind_miss_blood_glucose_24h=factor(ind_miss_blood_glucose_24h,levels=c("No","Yes")),
+         ind_miss_WBC_24h=factor(ind_miss_WBC_24h,levels=c("No","Yes")),
+         ind_miss_lactate_24h=factor(ind_miss_lactate_24h,levels=c("No","Yes")),
+         ind_miss_potassium_24h=factor(ind_miss_potassium_24h,levels=c("No","Yes")),
+         ind_miss_sodium_24h=factor(ind_miss_sodium_24h,levels=c("No","Yes")),
+         ind_miss_albumin_24h=factor(ind_miss_albumin_24h,levels=c("No","Yes")),
+         ind_miss_PLT_24h=factor(ind_miss_PLT_24h,levels=c("No","Yes")),
+         ind_miss_PaO2_over_FiO2_24h=factor(ind_miss_PaO2_over_FiO2_24h,levels=c("No","Yes")),
+         lowest_PaO2_over_FiO2_24h=factor(lowest_PaO2_over_FiO2_24h,levels=c("No_ARDS","Mild_ARDS",
+                                                                             "Moderate_ARDS",
+                                                                             "Severe_ARDS")),
+         MeVe=factor(MeVe,levels=c("No","Yes"))
+         )%>%
+  mutate(ind_miss_HGB_HCT_24h=ifelse((ind_miss_HGB_24h=="No")&(ind_miss_HCT_24h=="No"),"No",ifelse(Sex=="Female","Yes_Female","Yes_Male")),
+         ind_miss_HGB_HCT_24h=factor(ind_miss_HGB_HCT_24h,levels=c("No","Yes_Female","Yes_Male")),
+         ind_miss_bicarbonate_creatinine_sodium_24h=ifelse(
+           (ind_miss_bicarbonate_24h=="Yes")|(ind_miss_creatinine_24h=="Yes")|(ind_miss_sodium_24h=="Yes"),
+           "Yes","No"),
+         ind_miss_bicarbonate_creatinine_sodium_24h=factor(ind_miss_bicarbonate_creatinine_sodium_24h,levels=c("No","Yes")))%>%
+  dplyr::select(-ind_miss_HGB_24h,-ind_miss_HCT_24h,
+                -ind_miss_bicarbonate_24h,
+                -ind_miss_creatinine_24h,
+                -ind_miss_sodium_24h)
+
+data_full_filled_5000_use=data_full_filled_5000%>%
+  filter(!PATIENT_DEID%in%data_full_filled$PATIENT_DEID)
+```
+
+To keep the same results as in the modelling file, we split samples of the UNC 1000 data into training and test sets with ratio 4:1.
+
+```{r}
+set.seed(20230717)
+train_data=data_full_filled%>% 
+  sample_frac(0.80)
+test_data=anti_join(data_full_filled,train_data,by="PATIENT_DEID")
+```
+
+# Univariate and multivariate regression models
+
+In the following cell, statistics are shown for univariate and multivariate models.
+
+```{r}
+#"variables.data_all" is the vector of the variables, which will be used in the model. 
+#"variables.table" is the vector of the full names of the variables, which will be shown in the results table. 
+#"variables.table.full" is the vector of the full names of the variables including the levels of the categorical variables, which will be shown in the results table. 
+variables.table=c("APACHE II at 24 hours","SOFA at 24 hours","Age","Sex","MRC-ICU at 24 hours","ICU Type",
+                     "Mechanical Ventilation at 24 hours","ind_miss fluid balance at 24 hours","Fluid balance at 24 hours",
+                     "Admission Diagnosis","CRRT at 24 hours","Vasopressor at 24 hours",
+                     "ind_miss heart rate at 24 hours","Heart rate at 24 hours",
+                     "ind_miss SBP at 24 hours","SBP at 24 hours","ind_miss temperature at 24 hours",
+                     "Temperature at 24 hours","ind_miss pH at 24 hours","pH at 24 hours",
+                     "ind_miss bicarbonate & creatinine & sodium at 24 hours",
+                     "Bicarbonate at 24 hours","Creatinine at 24 hours",
+                     "ind_miss blood glucose at 24 hours","Blood glucose at 24 hours",
+                     "ind_miss WBC at 24 hours","WBC at 24 hours","ind_miss lactate at 24 hours",
+                     "Lactate at 24 hours","ind_miss potassium at 24 hours","Potassium at 24 hours",
+                     "Sodium at 24 hours","ind_miss albumin at 24 hours","Albumin at 24 hours",
+                     "ind_miss HGB & HCT at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                     "ind_miss PLT at 24 hours","PLT at 24 hours","ind_miss PaO2/FiO2 at 24 hours",
+                     "PaO2/FiO2 at 24 hours"
+                   )
+
+variables.table.full=c("APACHE II at 24 hours","SOFA at 24 hours","Age","Sex--Male","MRC-ICU at 24 hours",
+                     "ICU Type--Burn","ICU Type--Cardiac","ICU Type--Cardiothoracic Surgery",
+                     "ICU Type--Medical","ICU Type--Neurosciences","ICU Type--Surgical",
+                     "Mechanical Ventilation at 24 hours","ind_miss fluid balance at 24 hours","Fluid balance at 24 hours",
+                     "Admission Diagnosis--Burn","Admission Diagnosis--Cardiovascular",
+                     "Admission Diagnosis--Dermatology","Admission Diagnosis--Electrolyte Abnormalities",
+                     "Admission Diagnosis--Endocrine","Admission Diagnosis--Fever",
+                     "Admission Diagnosis--Gastrointestinal","Admission Diagnosis--Hematologic",
+                     "Admission Diagnosis--Hepatic","Admission Diagnosis--Infection",
+                     "Admission Diagnosis--Mental Health","Admission Diagnosis--Neoplasm",
+                     "Admission Diagnosis--Neurology","Admission Diagnosis--Pneumonia",
+                     "Admission Diagnosis--Pregnancy","Admission Diagnosis--Pulmonary",
+                     "Admission Diagnosis--Renal","Admission Diagnosis--Respiratory",
+                     "Admission Diagnosis--Respiratory Failure","Admission Diagnosis--Sepsis",
+                     "Admission Diagnosis--Shock","Admission Diagnosis--Syncope",
+                     "Admission Diagnosis--Toxicology Ingestion","Admission Diagnosis--Trauma",
+                     "Admission Diagnosis--Weakness","CRRT at 24 hours","Vasopressor at 24 hours",
+                     "ind_miss heart rate at 24 hours","Heart rate at 24 hours",
+                     "ind_miss SBP at 24 hours--Normal Vasso","ind_miss SBP at 24 hours--Abnormal low Vasso",
+                     "SBP at 24 hours--Abnormal low","ind_miss temperature at 24 hours",
+                     "Temperature at 24 hours","ind_miss pH at 24 hours",
+                     "pH at 24 hours--Abnormal low","pH at 24 hours--Abnormal high",
+                     "ind_miss bicarbonate & creatinine & sodium at 24 hours","Bicarbonate at 24 hours",
+                     "ind_miss bicarbonate & creatinine & sodium at 24 hours","Creatinine at 24 hours",
+                     "ind_miss blood glucose at 24 hours","Blood glucose at 24 hours",
+                     "ind_miss WBC at 24 hours","WBC at 24 hours",
+                     "ind_miss lactate at 24 hours","Lactate at 24 hours",
+                     "ind_miss potassium at 24 hours","Potassium at 24 hours",
+                     "ind_miss bicarbonate & creatinine & sodium at 24 hours","Sodium at 24 hours",
+                     "ind_miss albumin at 24 hours","Albumin at 24 hours",
+                     "ind_miss HGB & HCT at 24 hours--Female","ind_miss HGB & HCT at 24 hours--Male",
+                     "HGB at 24 hours",
+                     "ind_miss HGB & HCT at 24 hours--Female","ind_miss HGB & HCT at 24 hours--Male",
+                     "HCT at 24 hours", 
+                     "ind_miss PLT at 24 hours",
+                     "PLT at 24 hours","ind_miss PaO2/FiO2 at 24 hours",
+                     "PaO2/FiO2 at 24 hours--Mild ARDS","PaO2/FiO2 at 24 hours--Moderate ARDS",
+                     "PaO2/FiO2 at 24 hours--Severe ARDS")
+
+variables.data_all=c("APACHE_24h","SOFA_24h","Age","Sex",
+                   "MRC_24h","ICU_Type","MeVe_24h",
+                   "ind_miss_Fluid_balance_24h","Fluid_balance_24h",
+                   "Admission_Diagnosis","CRRT_24h","Vasopressor_24h",
+                   "ind_miss_heart_rate_24h","highest_heart_rate_24h",
+                   "ind_miss_SBP_24h","lowest_SBP_24h",
+                   "ind_miss_temperature_24h","extreme_temperature_24h",
+                   "ind_miss_pH_24h","extreme_pH_24h",
+                   "ind_miss_bicarbonate_creatinine_sodium_24h",
+                   "extreme_bicarbonate_24h","highest_creatinine_24h",
+                   "ind_miss_blood_glucose_24h","extreme_blood_glucose_24h",
+                   "ind_miss_WBC_24h","extreme_WBC_24h",
+                   "ind_miss_lactate_24h","highest_lactate_24h",
+                   "ind_miss_potassium_24h","extreme_potassium_24h",
+                   "extreme_sodium_24h","ind_miss_albumin_24h","lowest_albumin_24h",
+                   "ind_miss_HGB_HCT_24h","lowest_HGB_24h","lowest_HCT_24h",
+                   "ind_miss_PLT_24h","extreme_PLT_24h",
+                   "ind_miss_PaO2_over_FiO2_24h","lowest_PaO2_over_FiO2_24h")
+
+variables.data_broad=c("APACHE_24h","SOFA_24h","Age","Sex",
+                   "MRC_24h","ICU_Type","MeVe_24h",
+                   "Fluid_balance",
+                   "Admission_Diagnosis","CRRT_24h","Vasopressor_24h",
+                   "heart_rate",
+                   "SBP",
+                   "temperature",
+                   "pH",
+                   "bicarbonate","creatinine",
+                   "blood_glucose",
+                   "WBC",
+                   "lactate",
+                   "potassium",
+                   "sodium","albumin",
+                   "HGB","HCT",
+                   "PLT",
+                   "PaO2_over_FiO2")
+
+results.u_pred=c()
+
+#With for loop, we fit the simple logistic regression models.
+for (i in 1:length(variables.data_broad)){
+  vari.use=which(str_detect(variables.data_all,variables.data_broad[i]))
+  fit.pred=glm(reformulate(variables.data_all[vari.use],"Death_at_discharge"),
+                         data=train_data,
+                         family = "binomial")
+  coef.fit=format(ifelse(round(exp(coef(fit.pred)[-1]),4)>10^8,
+                         Inf,round(exp(coef(fit.pred)[-1]),4)),scientific=FALSE,nsmall=4)
+  confint.fit=format(ifelse(round(matrix(exp(confint.default(fit.pred))[-1,],ncol=2),4)>10^8,
+                            Inf,round(matrix(exp(confint.default(fit.pred))[-1,],ncol=2),4)),
+                     scientific=FALSE,nsmall=4)
+  confint.fit=paste("(",confint.fit[,1],", ",confint.fit[,2],")",sep="")
+  p.fit=format(round(summary(fit.pred)$coefficients[-1,4],4),scientific=FALSE,nsmall=4)
+  
+  results=cbind(coef.fit,confint.fit,p.fit)
+  results.u_pred=rbind(results.u_pred,results)
+}
+rownames(results.u_pred)=variables.table.full
+colnames(results.u_pred)=c("Univariate Odds Ratios","Univariate 95% CI","Univariate p-value")
+```
+
+In the following cell, statistics are shown for univariate and multivariate models.
+
+```{r}
+#The following code is for creating multivariate model.
+fit.pred=glm(reformulate(paste(paste(variables.data_all,
+                                     c(rep("+",length(variables.data_all)-1),""),
+                                     sep=""),collapse =""),
+                         "Death_at_discharge"),
+                         data=train_data,
+                         family = "binomial")
+
+#The results of multivariate model are combined in "results.m_pred"
+coef.fit=format(ifelse(round(exp(coef(fit.pred)[-1]),4)>10^8,
+                       Inf,round(exp(coef(fit.pred)[-1]),4)),scientific=FALSE,nsmall=4)
+confint.fit=format(ifelse(round(matrix(exp(confint.default(fit.pred))[-1,],ncol=2),4)>10^8,
+                          Inf,round(matrix(exp(confint.default(fit.pred))[-1,],ncol=2),4)),scientific=FALSE,nsmall=4)
+confint.fit=paste("(",confint.fit[,1],", ",confint.fit[,2],")",sep="")
+p.fit=format(round(summary(fit.pred)$coefficients[-1,4],4),scientific=FALSE,nsmall=4)
+
+results.m_pred=cbind(coef.fit,confint.fit,p.fit)
+results.m_pred=rbind(results.m_pred[1:53,],rep("/",3),results.m_pred[54:62,],
+                     rep("/",3),results.m_pred[63:68,],rep("/",3),rep("/",3),
+                     results.m_pred[69:75,])
+
+
+rownames(results.m_pred)=variables.table.full
+colnames(results.m_pred)=c("Multivariate Odds Ratios","Multivariate 95% CI","Multivariate p-value")
+
+#The reuslts of univariate and multivariate models are combined in the following table
+kable(cbind(results.u_pred,results.m_pred),caption = "Regression models for prediction of mortality",
+      align=rep("r",6))
+```
+
+```{r, warning=FALSE}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for linear logistic regression
+logistic_linear_both=glm(Death_at_discharge ~ SOFA_24h + Age + ind_miss_temperature_24h + 
+    lowest_albumin_24h + lowest_HGB_24h + lowest_HCT_24h,
+                         data=train_data,
+                         family = binomial)
+
+logistic_linear_both_pred_train=predict(logistic_linear_both,type="response")
+
+preds.death.train = data.frame(Death = logistic_linear_both_pred_train,
+                               Alive = 1-logistic_linear_both_pred_train,
+                               obs = train_data$Death_at_discharge,
+                               Group = "Linear Logistic")
+
+logistic_linear_both_pred_test=predict(logistic_linear_both,test_data,type="response")
+
+preds.death=data.frame(Death = logistic_linear_both_pred_test,
+                       Alive = 1-logistic_linear_both_pred_test,
+                       obs = test_data$Death_at_discharge,
+                       Group = "Linear Logistic")
+
+logistic_linear_both_pred_vali=predict(logistic_linear_both,data_full_filled_5000_use,type="response")
+
+preds.death.vali=data.frame(Death = logistic_linear_both_pred_vali,
+                       Alive = 1-logistic_linear_both_pred_vali,
+                       obs = data_full_filled_5000_use$Death_at_discharge,
+                       Group = "Linear Logistic")
+```
+
+```{r, warning = F}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for nature cubic splines
+logistic_ns_both=glm(Death_at_discharge ~ ns(APACHE_24h, df = 3, knots = c(8.5, 16.5)) + 
+                       SOFA_24h + MeVe_24h + ind_miss_temperature_24h + ind_miss_albumin_24h + 
+                       ns(lowest_HGB_24h, df = 3, knots = c(12.5, 14.1)) + ns(lowest_HCT_24h, 
+                                                                              df = 3, knots = c(40.6, 42.4)),
+                     data=train_data,
+                     family = binomial)
+
+logistic_ns_both_pred_train=predict(logistic_ns_both,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_ns_both_pred_train,
+                                     Alive = 1-logistic_ns_both_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Nature Cubic Splines Logistic")
+                          )
+
+logistic_ns_both_pred_test=predict(logistic_ns_both,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_ns_both_pred_test,
+                             Alive = 1-logistic_ns_both_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Nature Cubic Splines Logistic")
+                  )
+
+logistic_ns_both_pred_vali=predict(logistic_ns_both,data_full_filled_5000_use,type="response")
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = logistic_ns_both_pred_vali,
+                             Alive = 1-logistic_ns_both_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "Nature Cubic Splines Logistic")
+                  )
+```
+
+```{r, warning = F}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for smoothing spline regression
+logistic_ss_both=gam(Death_at_discharge ~ SOFA_24h + Age + s(Fluid_balance_24h, df = 2) + 
+    lowest_albumin_24h + lowest_HGB_24h + lowest_HCT_24h + ind_miss_temperature_24h,
+                     data=train_data,
+                     family = binomial)
+
+logistic_ss_both_pred_train=predict(logistic_ss_both,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_ss_both_pred_train,
+                                     Alive = 1-logistic_ss_both_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Smoothing Splines Logistic")
+                          )
+
+logistic_ss_both_pred_test=predict(logistic_ss_both,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_ss_both_pred_test,
+                             Alive = 1-logistic_ss_both_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Smoothing Splines Logistic")
+                  )
+
+logistic_ss_both_pred_vali=predict(logistic_ss_both,data_full_filled_5000_use,type="response")
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = logistic_ss_both_pred_vali,
+                             Alive = 1-logistic_ss_both_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "Smoothing Splines Logistic")
+                  )
+```
+
+```{r}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for local linear regression
+logistic_ll_both=gam(Death_at_discharge ~ SOFA_24h + Age + lo(Fluid_balance_24h, degree = 1, span = 0.9) + 
+                       lowest_albumin_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                       ind_miss_temperature_24h,
+                     data=train_data,
+                     family = binomial)
+
+logistic_ll_both_pred_train=predict(logistic_ll_both,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_ll_both_pred_train,
+                                     Alive = 1-logistic_ll_both_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Local Linear Logistic")
+                          )
+
+logistic_ll_both_pred_test=predict(logistic_ll_both,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_ll_both_pred_test,
+                             Alive = 1-logistic_ll_both_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Local Linear Logistic")
+                  )
+
+logistic_ll_both_pred_vali=predict(logistic_ll_both,data_full_filled_5000_use,type="response")
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = logistic_ll_both_pred_vali,
+                             Alive = 1-logistic_ll_both_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "Local Linear Logistic")
+                  )
+```
+
+```{r, warning=FALSE}
+#This is the baseline model, i.e. logistic regression with MRCICU+SOFA+APACHE.
+logistic_linear_prev=glm(Death_at_discharge~APACHE_24h + SOFA_24h + MRC_24h,
+                         data=train_data,
+                         family = binomial)
+
+logistic_linear_prev_pred_train=predict(logistic_linear_prev,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_linear_prev_pred_train,
+                                     Alive = 1-logistic_linear_prev_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "MRCICU + SOFA + APACHE II")
+                          )
+
+logistic_linear_prev_pred_test=predict(logistic_linear_prev,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_linear_prev_pred_test,
+                             Alive = 1-logistic_linear_prev_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "MRCICU + SOFA + APACHE II")
+                  )
+
+logistic_linear_prev_pred_vali=predict(logistic_linear_prev,data_full_filled_5000_use,type="response")
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = logistic_linear_prev_pred_vali,
+                             Alive = 1-logistic_linear_prev_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "MRCICU + SOFA + APACHE II")
+                  )
+```
+
+```{r, warning=FALSE}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for Random forest.
+set.seed(54321)
+Random_forest_mod=randomForest(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+                      data=train_data,
+                      mtry=2,
+                      ntree=700,
+                      importance=TRUE)
+
+Random_forest_pred_train=predict(Random_forest_mod,type="prob")[,2]
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = Random_forest_pred_train,
+                                     Alive = 1-Random_forest_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Random Forest")
+                          )
+
+Random_forest_pred_test=predict(Random_forest_mod,newdata=test_data,type="prob")[,2]
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = Random_forest_pred_test,
+                             Alive = 1-Random_forest_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Random Forest")
+                  )
+
+Random_forest_pred_vali=predict(Random_forest_mod,newdata=data_full_filled_5000_use,type="prob")[,2]
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = Random_forest_pred_vali,
+                             Alive = 1-Random_forest_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "Random Forest")
+                  )
+```
+
+```{r}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for SVM
+train_data.svm=train_data%>%
+  mutate(APACHE_24h=scale(APACHE_24h),
+         SOFA_24h=scale(SOFA_24h),
+         Age=scale(Age),
+         MRC_24h=scale(MRC_24h),
+         Fluid_balance_24h=scale(Fluid_balance_24h),
+         highest_heart_rate_24h=scale(highest_heart_rate_24h),
+         extreme_temperature_24h=scale(extreme_temperature_24h),
+         extreme_bicarbonate_24h=scale(extreme_bicarbonate_24h),
+         highest_creatinine_24h=scale(highest_creatinine_24h),
+         extreme_blood_glucose_24h=scale(extreme_blood_glucose_24h),
+         extreme_WBC_24h=scale(extreme_WBC_24h),
+         highest_lactate_24h=scale(highest_lactate_24h),
+         extreme_potassium_24h=scale(extreme_potassium_24h),
+         extreme_sodium_24h=scale(extreme_sodium_24h),
+         lowest_albumin_24h=scale(lowest_albumin_24h),
+         lowest_HGB_24h=scale(lowest_HGB_24h),
+         lowest_HCT_24h=scale(lowest_HCT_24h),
+         extreme_PLT_24h=scale(extreme_PLT_24h)
+         )
+
+set.seed(123456)
+svm_mod=svm(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+            data=train_data.svm,
+            cost=0.05,
+            kernel="linear",
+            probability=TRUE)
+
+
+svm_pred_train=attr(predict(svm_mod,newdata=train_data.svm,probability=TRUE), "probabilities")[,2]
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = svm_pred_train,
+                                     Alive = 1-svm_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "SVM")
+                          )
+
+test_data.svm=test_data%>%
+  mutate(APACHE_24h=scale(APACHE_24h),
+         SOFA_24h=scale(SOFA_24h),
+         Age=scale(Age),
+         MRC_24h=scale(MRC_24h),
+         Fluid_balance_24h=scale(Fluid_balance_24h),
+         highest_heart_rate_24h=scale(highest_heart_rate_24h),
+         extreme_temperature_24h=scale(extreme_temperature_24h),
+         extreme_bicarbonate_24h=scale(extreme_bicarbonate_24h),
+         highest_creatinine_24h=scale(highest_creatinine_24h),
+         extreme_blood_glucose_24h=scale(extreme_blood_glucose_24h),
+         extreme_WBC_24h=scale(extreme_WBC_24h),
+         highest_lactate_24h=scale(highest_lactate_24h),
+         extreme_potassium_24h=scale(extreme_potassium_24h),
+         extreme_sodium_24h=scale(extreme_sodium_24h),
+         lowest_albumin_24h=scale(lowest_albumin_24h),
+         lowest_HGB_24h=scale(lowest_HGB_24h),
+         lowest_HCT_24h=scale(lowest_HCT_24h),
+         extreme_PLT_24h=scale(extreme_PLT_24h)
+         )
+
+svm_pred_test=attr(predict(svm_mod,newdata=test_data.svm,probability=TRUE), "probabilities")[,2]
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = svm_pred_test,
+                             Alive = 1-svm_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "SVM")
+                  )
+
+data_full_filled_5000_use.svm=data_full_filled_5000_use%>%
+  mutate(APACHE_24h=scale(APACHE_24h),
+         SOFA_24h=scale(SOFA_24h),
+         Age=scale(Age),
+         MRC_24h=scale(MRC_24h),
+         Fluid_balance_24h=scale(Fluid_balance_24h),
+         highest_heart_rate_24h=scale(highest_heart_rate_24h),
+         extreme_temperature_24h=scale(extreme_temperature_24h),
+         extreme_bicarbonate_24h=scale(extreme_bicarbonate_24h),
+         highest_creatinine_24h=scale(highest_creatinine_24h),
+         extreme_blood_glucose_24h=scale(extreme_blood_glucose_24h),
+         extreme_WBC_24h=scale(extreme_WBC_24h),
+         highest_lactate_24h=scale(highest_lactate_24h),
+         extreme_potassium_24h=scale(extreme_potassium_24h),
+         extreme_sodium_24h=scale(extreme_sodium_24h),
+         lowest_albumin_24h=scale(lowest_albumin_24h),
+         lowest_HGB_24h=scale(lowest_HGB_24h),
+         lowest_HCT_24h=scale(lowest_HCT_24h),
+         extreme_PLT_24h=scale(extreme_PLT_24h)
+         )
+
+svm_pred_vali=attr(predict(svm_mod,newdata=data_full_filled_5000_use.svm,probability=TRUE), "probabilities")[,2]
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = svm_pred_vali,
+                             Alive = 1-svm_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "SVM")
+                  )
+```
+
+```{r}
+#Follow the comments in "Mortality Machine Learning Model fitting_code_with_comments.Rmd" file, 
+#and here we simply used the final model for XGBoost.
+train_data_xgb=Matrix::sparse.model.matrix(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h, data=train_data)[,-1]
+train_data_xgb_label=(train_data%>%
+                        mutate(Death_at_discharge=ifelse(Death_at_discharge=="Death",1,0)))$Death_at_discharge
+train_data_xgb_final=xgb.DMatrix(data=train_data_xgb,label=train_data_xgb_label)
+  
+test_data_xgb=Matrix::sparse.model.matrix(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h, data=test_data)[,-1]
+test_data_xgb_label=(test_data%>%
+                        mutate(Death_at_discharge=ifelse(Death_at_discharge=="Death",1,0)))$Death_at_discharge
+test_data_xgb_final=xgb.DMatrix(data=test_data_xgb,label=test_data_xgb_label)
+
+vali_data_xgb=Matrix::sparse.model.matrix(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h, data=data_full_filled_5000_use)[,-1]
+vali_data_xgb_label=(data_full_filled_5000_use%>%
+                        mutate(Death_at_discharge=ifelse(Death_at_discharge=="Death",1,0)))$Death_at_discharge
+vali_data_xgb_final=xgb.DMatrix(data=vali_data_xgb,label=vali_data_xgb_label)
+  
+set.seed(123456)
+xgb_mod=xgboost(data=train_data_xgb_final,objective="binary:logistic",
+                  nrounds=15,
+                  max_depth=4,
+                  eta=0.3,
+                  gamma=0,
+                  subsample=1,
+                  min_child_weight=1,
+                  colsample_bytree=0.6,
+                  verbose=0)
+
+xgb_pred_train=predict(xgb_mod,train_data_xgb_final)
+  
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = xgb_pred_train,
+                                     Alive = 1-xgb_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "XGBoost")
+                          )
+
+xgb_pred_test=predict(xgb_mod,test_data_xgb_final)
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = xgb_pred_test,
+                             Alive = 1-xgb_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "XGBoost")
+                  )
+
+xgb_pred_vali=predict(xgb_mod,vali_data_xgb_final)
+
+preds.death.vali=rbind(preds.death.vali,
+                  data.frame(Death = xgb_pred_vali,
+                             Alive = 1-xgb_pred_vali,
+                             obs = data_full_filled_5000_use$Death_at_discharge,
+                             Group = "XGBoost")
+                  )
+```
+
+# Test performance
+
+In this section, we compared 8 different models on prediction mortality. The models are given in the following bullet points. Each model is built on training set. Prediction results are given on both training set and test set.
+
+1. MRCICU + SOFA + APACHE II: This is the model we used in the last paper, which is used as a baseline model.
+
+2. Logistic Regression with linear predictors: Firstly, we used all predictors to build this model linearly. Then we used stepwise selection via BIC for simplifying this model. And the final model is given as "Death_at_discharge ~ SOFA_24h + Age + ind_miss_temperature_24h + lowest_albumin_24h + lowest_HGB_24h + lowest_HCT_24h", where 6 predictors are remained in the final model. For short, ind_miss_temperature_24h means the indicator for the missingness of temperature in first 24h.
+
+3. Logistic Regression with Nature Cubic Splines: Firstly, we used all predictors to build this model. Most continuous variables are fitted with nature cubic splines. Then we used stepwise selection via BIC for simplifying this model. And the final model is given as "Death_at_discharge ~ ns(APACHE_24h, df = 3, knots = c(8.5, 16.5)) + SOFA_24h + MeVe_24h + ind_miss_temperature_24h + ind_miss_albumin_24h + ns(lowest_HGB_24h, df = 3, knots = c(12.5, 14.1)) + ns(lowest_HCT_24h, df = 3, knots = c(40.6, 42.4))", where 7 predictors are remained in the final model. MeVe_24h means Mechanical Ventilation at 24 hours; ind_miss_albumin_24h means the indicator for the missingness of albumin in first 24h. The ns terms means that nature splines are used for the predictor. SOFA_24h is only used as a linear predictor.
+
+4. Logistic Regression with Smoothing Splines: Firstly, we used all predictors to build this model. Most continuous variables are fitted with smoothing splines with 5 df. Then we used stepwise selection via BIC for simplifying this model. And the final model is given as "Death_at_discharge ~ SOFA_24h + Age + s(Fluid_balance_24h, df = 2) + lowest_albumin_24h + lowest_HGB_24h + lowest_HCT_24h + ind_miss_temperature_24h", where 7 predictors are remained in the final model. All continuous variables used in this model except Fluid_balance_24h are linear predictors. s(Fluid_balance_24h, df = 2) means Fluid_balance_24h is fitted using a smoothing spline with 2 df.
+
+5. Local Linear Logistic Regression: Firstly, we used 5 fold Cross Validation to choose the best "span" hyperparameter for local linear regression on the training set. "span" means the proportion of observations in a neighborhood of every point to be used for fitting the models. For every "span" candidate parameter in every fold, we first considered all predictors to build the models, and most continuous variables are fitted with local linear splines; then, we used stepwise selection via BIC for simplifying the models; finally, metric AUROC was used for finding the best "span" value, which turns out to be 0.9. 
+With the best "span" value, we built the model again on the training set, and applied stepwise selection via BIC for simplifying the models. The final model is given as "Death_at_discharge ~ SOFA_24h + Age + lo(Fluid_balance_24h, degree = 1, span = 0.9) + lowest_albumin_24h + lowest_HGB_24h + lowest_HCT_24h + ind_miss_temperature_24h", which has the same predictors as Logistic Regression with Smoothing Splines. All continuous variables used in this model except Fluid_balance_24h are linear predictors.
+
+6. Random Forest: Firstly, we used 5 fold Cross Validation to choose the best hyperparameters for "number of trees", and "number of variables randomly sampled as candidates at each split", which turns out to be ntree=700, and mtry=2.
+With the best hyperparameters, we built the model again on the training set with all predictors.
+
+7. Support Vector Machine: Firstly, we used 5 fold Cross Validation to choose the best hyperparameter for "cost of constraints violation", which turns out to be C=0.05.
+With the best hyperparameters, we built the model again on the training set with all predictors.
+
+8. XGBoost: Firstly, we used 5 fold Cross Validation to choose the best hyperparameters for "max number of boosting iterations", and "maximum depth of a tree", which turns out to be nrounds=15, max_depth=4.
+With the best hyperparameters, we built the model again on the training set with all predictors.
+
+## ROC Curves
+
+In the following graph, the ROC curves of the 8 models on training set are shown.
+
+```{r, warning = F}
+#"evalm" function is used to plot ROC curves
+test1 = evalm(preds.death.train, plot = "r", bins = 2, positive="Death")
+```
+
+The corresponding AUROC and their confidence intervals on training set are given in the following table.
+
+```{r}
+#All AUROC related statistics are combined in "roc.train".
+roc.train=c()
+
+for (i in 1:8){
+  roc.train=c(roc.train,paste(test1$optres[[i]][13,1],", ",test1$optres[[i]][13,2],sep=""))
+}
+
+roc.train=matrix(roc.train)
+rownames(roc.train)=names(test1$optres)
+colnames(roc.train)=c("AUROC")
+kable(roc.train,caption = "AUROC and 95% Confidence Intervals on Training Set",
+      align=rep("r",1))
+```
+
+In the following graph, the ROC curves of the 8 models on test set are shown.
+
+```{r}
+#"evalm" function is used to plot ROC curves
+test2 = evalm(preds.death, plot = "r", bins = 2 ,positive="Death")
+```
+
+The corresponding AUROC and their confidence intervals on test set are given in the following table.
+
+```{r}
+#All AUROC related statistics are combined in "roc.test".
+roc.test=c()
+for (i in 1:8){
+  roc.test=c(roc.test,paste(test2$optres[[i]][13,1],", ",test2$optres[[i]][13,2],sep=""))
+}
+
+roc.test=matrix(roc.test)
+rownames(roc.test)=names(test2$optres)
+colnames(roc.test)=c("AUROC")
+kable(roc.test,caption = "AUROC and 95% Confidence Intervals on Test Set",
+      align=rep("r",1))
+```
+
+In the following graph, the ROC curves of the 8 models on validation set (UNC 5000 data set) are shown.
+
+```{r}
+#"evalm" function is used to plot ROC curves
+test3 = evalm(preds.death.vali, plot = "r", bins = 2 ,positive="Death")
+```
+
+The corresponding AUROC and their confidence intervals on validation set are given in the following table.
+
+```{r}
+#All AUROC related statistics are combined in "roc.vali".
+roc.vali=c()
+for (i in 1:8){
+  roc.vali=c(roc.vali,paste(test3$optres[[i]][13,1],", ",test3$optres[[i]][13,2],sep=""))
+}
+
+roc.vali=matrix(roc.vali)
+rownames(roc.vali)=names(test3$optres)
+colnames(roc.vali)=c("AUROC")
+kable(roc.vali,caption = "AUROC and 95% Confidence Intervals on Validation Set",
+      align=rep("r",1))
+```
+
+```{r}
+#Find out the thresholds under 3 criteria.
+death.threshold.inf=c()
+for (i in 1:length(test1$probs)){
+  death.threshold.inf=c(death.threshold.inf,
+                        test1$probs[[i]][order(test1$probs[[i]]$Informedness,decreasing=T),1][1])
+}
+
+death.threshold.mcc=c()
+for (i in 1:length(test1$probs)){
+  death.threshold.mcc=c(death.threshold.mcc,
+                        test1$probs[[i]][order(test1$probs[[i]]$MCC,decreasing=T),1][1])
+}
+
+death.threshold.F1=c()
+for (i in 1:length(test1$probs)){
+  death.threshold.F1=c(death.threshold.F1,
+                       test1$probs[[i]][order(test1$probs[[i]]$F1,decreasing=T),1][1])
+}
+```
+
+## Model metrics
+
+In this section, the model metrics and corresponding confidence intervals are given. Three sets of results are given in the following tables. These results are different from each other by the criteria for choosing thresholds in prediction. In each method, the threshold is firstly chosen on the training set, and then used in the prediction on the test set. In the following tables, we showed the NPV, PPV, Specificity, and Sensitivity for the six models. In each cell, the score and corresponding 95% CI are given.
+
+In the following table, the results of using the threshold maximizing Informedness on training set are given. Informedness is defined as $INF=TPR+TNR-1$, where $INF$ is short for Informedness, $TPR$ is short for true positive rate (sensitivity), and $TNR$ is short for true negative rate (specificity). In other words, this criteria maximized the sum of sensitivity and specificity.
+
+```{r}
+results_metric.inf=matrix("",8,5)
+colnames(results_metric.inf)=c("Accuracy","Sensitivity","Specificity","PPV","NPV")
+rownames(results_metric.inf)=names(test2$probs)
+
+for (i in 1:8){
+  test.pred.inf=factor(ifelse(test2$probs[[i]]$Death>=death.threshold.inf[[i]],"Death","Alive"))
+  test.obs.inf=test2$probs[[i]]$obs
+  #With thresholds in "death.threshold.inf", the confusion matrix and corresponding results are calculated.
+  confu.matrix.inf=confusionMatrix(data=test.pred.inf, reference = test.obs.inf,positive="Death")
+  tests.inf=epi.tests(confu.matrix.inf$table[c(4,2,3,1)],method="wilson")$detail[c(3,4,9,10),]
+  res.inf=c(paste(round(confu.matrix.inf$overall[1],2),", ",
+                  round(confu.matrix.inf$overall[3],2),"-",
+                  round(confu.matrix.inf$overall[4],2),sep=""),
+            paste(round(tests.inf[,2],2),", ",round(tests.inf[,3],2),"-",round(tests.inf[,4],2),sep=""))
+  results_metric.inf[i,]=res.inf
+}
+kable(results_metric.inf,caption = "Model Metric Scores and 95% CIs with Threshold Choosen by INF on Test set",
+      align=rep("r",5))
+```
+
+In the following table, the performances on validation set is shown.
+
+```{r}
+results_metric.inf=matrix("",8,5)
+colnames(results_metric.inf)=c("Accuracy","Sensitivity","Specificity","PPV","NPV")
+rownames(results_metric.inf)=names(test3$probs)
+
+for (i in 1:8){
+  test.pred.inf=factor(ifelse(test3$probs[[i]]$Death>=death.threshold.inf[[i]],"Death","Alive"))
+  test.obs.inf=test3$probs[[i]]$obs
+  #With thresholds in "death.threshold.inf", the confusion matrix and corresponding results are calculated.
+  confu.matrix.inf=confusionMatrix(data=test.pred.inf, reference = test.obs.inf,positive="Death")
+  tests.inf=epi.tests(confu.matrix.inf$table[c(4,2,3,1)],method="wilson")$detail[c(3,4,9,10),]
+  res.inf=c(paste(round(confu.matrix.inf$overall[1],2),", ",
+                  round(confu.matrix.inf$overall[3],2),"-",
+                  round(confu.matrix.inf$overall[4],2),sep=""),
+            paste(round(tests.inf[,2],2),", ",round(tests.inf[,3],2),"-",round(tests.inf[,4],2),sep=""))
+  results_metric.inf[i,]=res.inf
+}
+kable(results_metric.inf,caption = "Model Metric Scores and 95% CIs with Threshold Choosen by INF on Validation Set",
+      align=rep("r",5))
+```
+
+In the following table, the results of using the threshold maximizing Matthews Correlation Coefficient (MCC) on training set are given. MCC is defined as $MCC=\frac{TN\times TP-FP\times FN}{\sqrt{(TN+FN)(FP+TP)(TN+FP)(FN+TP)}}$.
+
+```{r}
+results_metric.mcc=matrix("",8,5)
+colnames(results_metric.mcc)=c("Accuracy","Sensitivity","Specificity","PPV","NPV")
+rownames(results_metric.mcc)=names(test2$probs)
+
+for (i in 1:8){
+  test.pred.mcc=factor(ifelse(test2$probs[[i]]$Death>=death.threshold.mcc[[i]],"Death","Alive"))
+  test.obs.mcc=test2$probs[[i]]$obs
+  #With thresholds in "death.threshold.mcc", the confusion matrix and corresponding results are calculated.
+  confu.matrix.mcc=confusionMatrix(data=test.pred.mcc, reference = test.obs.mcc,positive="Death")
+  tests.mcc=epi.tests(confu.matrix.mcc$table[c(4,2,3,1)],method="wilson")$detail[c(3,4,9,10),]
+  res.mcc=c(paste(round(confu.matrix.mcc$overall[1],2),", ",
+                  round(confu.matrix.mcc$overall[3],2),"-",
+                  round(confu.matrix.mcc$overall[4],2),sep=""),
+            paste(round(tests.mcc[,2],2),", ",round(tests.mcc[,3],2),"-",round(tests.mcc[,4],2),sep=""))
+  results_metric.mcc[i,]=res.mcc
+}
+kable(results_metric.mcc,caption = "Model Metric Scores and 95% CIs with Threshold Choosen by MCC on Test set",
+      align=rep("r",5))
+```
+
+In the following table, the performances on validation set is shown.
+
+```{r}
+results_metric.mcc=matrix("",8,5)
+colnames(results_metric.mcc)=c("Accuracy","Sensitivity","Specificity","PPV","NPV")
+rownames(results_metric.mcc)=names(test3$probs)
+
+for (i in 1:8){
+  test.pred.mcc=factor(ifelse(test3$probs[[i]]$Death>=death.threshold.mcc[[i]],"Death","Alive"))
+  test.obs.mcc=test3$probs[[i]]$obs
+  #With thresholds in "death.threshold.mcc", the confusion matrix and corresponding results are calculated.
+  confu.matrix.mcc=confusionMatrix(data=test.pred.mcc, reference = test.obs.mcc,positive="Death")
+  tests.mcc=epi.tests(confu.matrix.mcc$table[c(4,2,3,1)],method="wilson")$detail[c(3,4,9,10),]
+  res.mcc=c(paste(round(confu.matrix.mcc$overall[1],2),", ",
+                  round(confu.matrix.mcc$overall[3],2),"-",
+                  round(confu.matrix.mcc$overall[4],2),sep=""),
+            paste(round(tests.mcc[,2],2),", ",round(tests.mcc[,3],2),"-",round(tests.mcc[,4],2),sep=""))
+  results_metric.mcc[i,]=res.mcc
+}
+kable(results_metric.mcc,caption = "Model Metric Scores and 95% CIs with Threshold Choosen by MCC on Validation set",
+      align=rep("r",5))
+```
+
+In the following table, the results of using the threshold maximizing F1 score on training set are given. F1 score is defined as $F1=2\times\frac{PPV\times TPR}{PPV+TPR}=\frac{2TP}{2TP+FN+FP}$, which is the harmonic mean of PPV (precision) and TPR (sensitivity).
+
+```{r}
+results_metric.F1=matrix("",8,5)
+colnames(results_metric.F1)=c("Accuracy","Sensitivity","Specificity","PPV","NPV")
+rownames(results_metric.F1)=names(test2$probs)
+
+for (i in 1:8){
+  test.pred.F1=factor(ifelse(test2$probs[[i]]$Death>=death.threshold.F1[[i]],"Death","Alive"))
+  test.obs.F1=test2$probs[[i]]$obs
+  #With thresholds in "death.threshold.F1", the confusion matrix and corresponding results are calculated.
+  confu.matrix.F1=confusionMatrix(data=test.pred.F1, reference = test.obs.F1,positive="Death")
+  tests.F1=epi.tests(confu.matrix.F1$table[c(4,2,3,1)],method="wilson")$detail[c(3,4,9,10),]
+  res.F1=c(paste(round(confu.matrix.F1$overall[1],2),", ",
+                  round(confu.matrix.F1$overall[3],2),"-",
+                  round(confu.matrix.F1$overall[4],2),sep=""),
+            paste(round(tests.F1[,2],2),", ",round(tests.F1[,3],2),"-",round(tests.F1[,4],2),sep=""))
+  results_metric.F1[i,]=res.F1
+}
+kable(results_metric.F1,caption = "Model Metric Scores and 95% CIs with Threshold Choosen by F1 on Test Set",
+      align=rep("r",5))
+```
+
+In the following table, the performances on validation set is shown.
+
+```{r}
+results_metric.F1=matrix("",8,5)
+colnames(results_metric.F1)=c("Accuracy","Sensitivity","Specificity","PPV","NPV")
+rownames(results_metric.F1)=names(test3$probs)
+
+for (i in 1:8){
+  test.pred.F1=factor(ifelse(test3$probs[[i]]$Death>=death.threshold.F1[[i]],"Death","Alive"))
+  test.obs.F1=test3$probs[[i]]$obs
+  #With thresholds in "death.threshold.F1", the confusion matrix and corresponding results are calculated.
+  confu.matrix.F1=confusionMatrix(data=test.pred.F1, reference = test.obs.F1,positive="Death")
+  tests.F1=epi.tests(confu.matrix.F1$table[c(4,2,3,1)],method="wilson")$detail[c(3,4,9,10),]
+  res.F1=c(paste(round(confu.matrix.F1$overall[1],2),", ",
+                  round(confu.matrix.F1$overall[3],2),"-",
+                  round(confu.matrix.F1$overall[4],2),sep=""),
+            paste(round(tests.F1[,2],2),", ",round(tests.F1[,3],2),"-",round(tests.F1[,4],2),sep=""))
+  results_metric.F1[i,]=res.F1
+}
+kable(results_metric.F1,caption = "Model Metric Scores and 95% CIs with Threshold Choosen by F1 on Validation Set",
+      align=rep("r",5))
+```
+
+# Feature importance
+
+In this section, we showcase the importance graphs of three ML models, XGBoost, Random forest, and SVM.
+
+## XGBoost
+
+```{r}
+#All feature names are listed in vector "Xgboost.features"
+Xgboost.features=c("APACHE II at 24 hours","Albumin at 24 hours","SOFA at 24 hours",
+                   "Age","Sodium at 24 hours","PLT at 24 hours","Bicarbonate at 24 hours",
+                   "HGB at 24 hours","Fluid balance at 24 hours","HCT at 24 hours",
+                   "Heart rate at 24 hours","Creatinine at 24 hours","ind_miss temperature at 24 hours",
+                   "WBC at 24 hours","PaO2/FiO2 at 24 hours--Moderate ARDS","Blood glucose at 24 hours",
+                   "Temperature at 24 hours","Lactate at 24 hours","PaO2/FiO2 at 24 hours--Severe ARDS",
+                   "ind_miss PaO2/FiO2 at 24 hours","MRC-ICU at 24 hours","ind_miss albumin at 24 hours",
+                   "Sex","ind_miss fluid balance at 24 hours","Admission Diagnosis--Pulmonary",
+                   "ICU Type--Medical","Admission Diagnosis--Gastrointestinal",
+                   "Admission Diagnosis--Cardiovascular","pH at 24 hours--Abnormal low",
+                   "Mechanical Ventilation at 24 hours","ind_miss lactate at 24 hours","Potassium at 24 hours",
+                   "Admission Diagnosis--Sepsis","Admission Diagnosis--Neoplasm","ind_miss PLT at 24 hours")
+```
+
+
+```{r}
+importance_matrix.XGB=xgb.importance(feature_names=NULL,model=xgb_mod)
+importance_matrix.XGB$Feature=Xgboost.features
+xgb.ggplot.importance(importance_matrix.XGB[1:30,], measure="Frequency")
+```
+
+## Random forest
+
+```{r}
+#All feature names needed to be shown in the result graph are listed in vector "variables.table.rf"
+variables.table.rf=c("APACHE II at 24 hours","SOFA at 24 hours","Age","Sex","MRC-ICU at 24 hours","ICU Type",
+                     "Mechanical Ventilation at 24 hours","ind_miss fluid balance at 24 hours","Fluid balance at 24 hours",
+                     "Admission Diagnosis","CRRT at 24 hours","Vasopressor at 24 hours",
+                     "ind_miss heart rate at 24 hours","Heart rate at 24 hours",
+                     "ind_miss SBP at 24 hours","SBP at 24 hours","ind_miss temperature at 24 hours",
+                     "Temperature at 24 hours","ind_miss pH at 24 hours","pH at 24 hours",
+                     "ind_miss bicarbonate & creatinine & sodium at 24 hours",
+                     "Bicarbonate at 24 hours","Creatinine at 24 hours",
+                     "ind_miss blood glucose at 24 hours","Blood glucose at 24 hours",
+                     "ind_miss WBC at 24 hours","WBC at 24 hours","ind_miss lactate at 24 hours",
+                     "Lactate at 24 hours","ind_miss potassium at 24 hours","Potassium at 24 hours",
+                     "Sodium at 24 hours","ind_miss albumin at 24 hours","Albumin at 24 hours",
+                     "ind_miss HGB & HCT at 24 hours","HGB at 24 hours","HCT at 24 hours",
+                     "ind_miss PLT at 24 hours","PLT at 24 hours","ind_miss PaO2/FiO2 at 24 hours",
+                     "PaO2/FiO2 at 24 hours")
+
+#All feature names in the data are listed in vector "variables.data.rf"
+variables.data.rf=c("APACHE_24h","SOFA_24h","Age","Sex","MRC_24h","ICU_Type",
+                    "MeVe_24h","ind_miss_Fluid_balance_24h","Fluid_balance_24h",
+                    "Admission_Diagnosis","CRRT_24h","Vasopressor_24h",
+                    "ind_miss_heart_rate_24h","highest_heart_rate_24h",
+                    "ind_miss_SBP_24h","lowest_SBP_24h","ind_miss_temperature_24h",
+                    "extreme_temperature_24h","ind_miss_pH_24h","extreme_pH_24h",
+                    "ind_miss_bicarbonate_creatinine_sodium_24h",
+                    "extreme_bicarbonate_24h","highest_creatinine_24h",
+                    "ind_miss_blood_glucose_24h","extreme_blood_glucose_24h",
+                    "ind_miss_WBC_24h","extreme_WBC_24h","ind_miss_lactate_24h",
+                    "highest_lactate_24h","ind_miss_potassium_24h",
+                    "extreme_potassium_24h","extreme_sodium_24h",
+                    "ind_miss_albumin_24h","lowest_albumin_24h",
+                    "ind_miss_HGB_HCT_24h","lowest_HGB_24h","lowest_HCT_24h",
+                    "ind_miss_PLT_24h","extreme_PLT_24h",
+                    "ind_miss_PaO2_over_FiO2_24h","lowest_PaO2_over_FiO2_24h")
+
+#The following function is defined to modify the names of variables in the data to the full names of variables we need to show in the graph
+var.name.change=function(name.v,data.name.vector,table.name.vector){
+  return(table.name.vector[which(name.v==data.name.vector)])
+}
+
+#Similar with the feature importance functions for XGBoost, we define the feature importance functions for RF
+#In these functions, the feature importances are measured by mean decrease in node impurity.
+rf.feature.imp=function(rf.model.f){
+  f.imp.m=randomForest::importance(rf.model.f,type=2)
+  rownames(f.imp.m)=sapply(rownames(f.imp.m),var.name.change,
+                           data.name.vector=variables.data.rf,
+                           table.name.vector=variables.table.rf
+                           )
+  feature.imp.m=f.imp.m[order(f.imp.m[,1],decreasing=T),]
+  feature.imp=data.frame(mdia=feature.imp.m,variables=names(feature.imp.m))
+  return(feature.imp)
+}
+
+#In this function, rf.model.f is the RF model we need to use.
+#n represents the number of top features that should be reserved in the graph.
+#c_low and c_high represent the minimum and maximum of number of clusters that should be considered.
+rf.feature.imp.plot=function(rf.model.f,n,c_low=1,c_high=30){
+  f.imp.m=randomForest::importance(rf.model.f,type=2)
+  rownames(f.imp.m)=sapply(rownames(f.imp.m),var.name.change,
+                           data.name.vector=variables.data.rf,
+                           table.name.vector=variables.table.rf
+                           )
+  feature.imp.m=f.imp.m[order(f.imp.m[,1],decreasing=T),]
+  feature.imp=data.frame(mdia=feature.imp.m,variables=names(feature.imp.m))[1:n,]
+  clusters=suppressWarnings(Ckmeans.1d.dp::Ckmeans.1d.dp(feature.imp.m[1:n],c_low:c_high))
+  plot=ggplot2::ggplot(feature.imp,ggplot2::aes(x=factor(variables,levels=rev(variables)), 
+                                                y=mdia,width=0.5),environment=environment())+
+    ggplot2::geom_bar(ggplot2::aes(fill=factor(clusters$cluster)),stat="identity",position="identity")+
+    ggplot2::coord_flip()+ggplot2::xlab("Features")+ggplot2::ggtitle("Feature importance")+
+    labs(fill = "Cluster")+
+    ggplot2::theme(plot.title=ggplot2::element_text(lineheight=0.9,face="bold"),
+                   panel.grid.major.y=ggplot2::element_blank())
+  return(plot)
+}
+```
+
+```{r}
+rf.feature.imp.plot(Random_forest_mod,30,3,30)
+```
+
+## SVM
+
+```{r}
+#All feature names needed to be shown in the result graph are listed in vector "variables.table.svm"
+variables.table.svm=c("APACHE II at 24 hours","SOFA at 24 hours","Age","Sex--Female","Sex--Male","MRC-ICU at 24 hours",
+                     "ICU Type--Burn","ICU Type--Cardiac","ICU Type--Cardiothoracic Surgery",
+                     "ICU Type--Medical","ICU Type--Neurosciences","ICU Type--Surgical",
+                     "Mechanical Ventilation at 24 hours","ind_miss fluid balance at 24 hours","Fluid balance at 24 hours",
+                     "Admission Diagnosis--Burn","Admission Diagnosis--Cardiovascular",
+                     "Admission Diagnosis--Dermatology","Admission Diagnosis--Electrolyte Abnormalities",
+                     "Admission Diagnosis--Endocrine","Admission Diagnosis--Fever",
+                     "Admission Diagnosis--Gastrointestinal","Admission Diagnosis--Hematologic",
+                     "Admission Diagnosis--Hepatic","Admission Diagnosis--Infection",
+                     "Admission Diagnosis--Mental Health","Admission Diagnosis--Neoplasm",
+                     "Admission Diagnosis--Neurology","Admission Diagnosis--Pneumonia",
+                     "Admission Diagnosis--Pregnancy","Admission Diagnosis--Pulmonary",
+                     "Admission Diagnosis--Renal","Admission Diagnosis--Respiratory",
+                     "Admission Diagnosis--Respiratory Failure","Admission Diagnosis--Sepsis",
+                     "Admission Diagnosis--Shock","Admission Diagnosis--Syncope",
+                     "Admission Diagnosis--Toxicology Ingestion","Admission Diagnosis--Trauma",
+                     "Admission Diagnosis--Weakness","CRRT at 24 hours","Vasopressor at 24 hours",
+                     "ind_miss heart rate at 24 hours","Heart rate at 24 hours",
+                     "ind_miss SBP at 24 hours--Normal Vasso","ind_miss SBP at 24 hours--Abnormal low Vasso",
+                     "SBP at 24 hours--Abnormal low","ind_miss temperature at 24 hours",
+                     "Temperature at 24 hours","ind_miss pH at 24 hours",
+                     "pH at 24 hours--Abnormal low","pH at 24 hours--Abnormal high",
+                     "ind_miss bicarbonate & creatinine & sodium at 24 hours","Bicarbonate at 24 hours",
+                     "Creatinine at 24 hours","ind_miss blood glucose at 24 hours","Blood glucose at 24 hours",
+                     "ind_miss WBC at 24 hours","WBC at 24 hours",
+                     "ind_miss lactate at 24 hours","Lactate at 24 hours",
+                     "ind_miss potassium at 24 hours","Potassium at 24 hours",
+                     "Sodium at 24 hours","ind_miss albumin at 24 hours","Albumin at 24 hours",
+                     "ind_miss HGB & HCT at 24 hours--Female","ind_miss HGB & HCT at 24 hours--Male",
+                     "HGB at 24 hours","HCT at 24 hours", "ind_miss PLT at 24 hours",
+                     "PLT at 24 hours","ind_miss PaO2/FiO2 at 24 hours",
+                     "PaO2/FiO2 at 24 hours--Mild ARDS","PaO2/FiO2 at 24 hours--Moderate ARDS",
+                     "PaO2/FiO2 at 24 hours--Severe ARDS")
+
+#All feature names in the data are listed in vector "variables.data.svm"
+variables.data.svm=c("APACHE_24h","SOFA_24h","Age","SexFemale","SexMale","MRC_24h",
+                     "ICU_TypeBurn","ICU_TypeCardiac","ICU_TypeCardiothoracic.Surgery",
+                     "ICU_TypeMedical","ICU_TypeNeurosciences","ICU_TypeSurgical",
+                     "MeVe_24hYes","ind_miss_Fluid_balance_24hYes","Fluid_balance_24h",
+                     "Admission_DiagnosisBurn","Admission_DiagnosisCardiovascular",
+                     "Admission_DiagnosisDermatology","Admission_DiagnosisElectrolyte.Abnormalities",
+                     "Admission_DiagnosisEndocrine","Admission_DiagnosisFever",
+                     "Admission_DiagnosisGastrointestinal","Admission_DiagnosisHematologic",
+                     "Admission_DiagnosisHepatic","Admission_DiagnosisInfection",
+                     "Admission_DiagnosisMental.Health","Admission_DiagnosisNeoplasm",
+                     "Admission_DiagnosisNeurology","Admission_DiagnosisPneumonia",
+                     "Admission_DiagnosisPregnancy","Admission_DiagnosisPulmonary",
+                     "Admission_DiagnosisRenal","Admission_DiagnosisRespiratory",
+                     "Admission_DiagnosisRespiratory.Failure","Admission_DiagnosisSepsis",
+                     "Admission_DiagnosisShock","Admission_DiagnosisSyncope",
+                     "Admission_DiagnosisToxicology.Ingestion","Admission_DiagnosisTrauma",
+                     "Admission_DiagnosisWeakness","CRRT_24hYes","Vasopressor_24hYes",
+                     "ind_miss_heart_rate_24hYes","highest_heart_rate_24h",
+                     "ind_miss_SBP_24hNormal_Vasso","ind_miss_SBP_24hAbnormal_low_Vasso",
+                     "lowest_SBP_24hAbnormal_low","ind_miss_temperature_24hYes",
+                     "extreme_temperature_24h","ind_miss_pH_24hYes",
+                     "extreme_pH_24hAbnormal_low","extreme_pH_24hAbnormal_high",
+                     "ind_miss_bicarbonate_creatinine_sodium_24hYes","extreme_bicarbonate_24h",
+                     "highest_creatinine_24h","ind_miss_blood_glucose_24hYes",
+                     "extreme_blood_glucose_24h","ind_miss_WBC_24hYes","extreme_WBC_24h",
+                     "ind_miss_lactate_24hYes","highest_lactate_24h",
+                     "ind_miss_potassium_24hYes","extreme_potassium_24h",
+                     "extreme_sodium_24h","ind_miss_albumin_24hYes","lowest_albumin_24h",
+                     "ind_miss_HGB_HCT_24hYes_Female","ind_miss_HGB_HCT_24hYes_Male",
+                     "lowest_HGB_24h","lowest_HCT_24h","ind_miss_PLT_24hYes",
+                     "extreme_PLT_24h","ind_miss_PaO2_over_FiO2_24hYes",
+                     "lowest_PaO2_over_FiO2_24hMild_ARDS","lowest_PaO2_over_FiO2_24hModerate_ARDS",
+                     "lowest_PaO2_over_FiO2_24hSevere_ARDS")
+
+#The following function is defined to modify the names of variables in the data to the full names of variables we need to show in the graph
+var.name.change=function(name.v,data.name.vector,table.name.vector){
+  return(table.name.vector[which(name.v==data.name.vector)])
+}
+
+#Similar with the feature importance functions for XGBoost, we define the feature importance functions for SVM
+#In these functions, the feature importances are measured by magnitude of the coefficients.
+svm.feature.imp=function(svm.model.f){
+  svm.imp.m=(t(svm.model.f$SV)%*%svm.model.f$coefs)
+  svm.imp.name=names(svm.imp.m)
+  svm.imp.m=matrix(abs(svm.imp.m))
+  rownames(svm.imp.m)=svm.imp.name
+  
+  rownames(svm.imp.m)=sapply(rownames(svm.imp.m),var.name.change,
+                           data.name.vector=variables.data.svm,
+                           table.name.vector=variables.table.svm
+                           )
+  feature.imp.m=svm.imp.m[order(svm.imp.m[,1],decreasing=T),]
+  feature.imp=data.frame(coe=feature.imp.m,variables=names(feature.imp.m))
+  return(feature.imp)
+}
+
+#In this function, svm.model.f is the SVM model we need to use.
+#n represents the number of top features that should be reserved in the graph.
+#c_low and c_high represent the minimum and maximum of number of clusters that should be considered.
+svm.feature.imp.plot=function(svm.model.f,n,c_low=1,c_high=30){
+  svm.imp.m=(t(svm.model.f$SV)%*%svm.model.f$coefs)
+  svm.imp.name=rownames(svm.imp.m)
+  svm.imp.m=matrix(abs(svm.imp.m))
+  rownames(svm.imp.m)=svm.imp.name
+  
+  rownames(svm.imp.m)=sapply(rownames(svm.imp.m),var.name.change,
+                           data.name.vector=variables.data.svm,
+                           table.name.vector=variables.table.svm
+                           )
+  feature.imp.m=svm.imp.m[order(svm.imp.m[,1],decreasing=T),]
+  feature.imp=data.frame(coe=feature.imp.m,variables=names(feature.imp.m))[1:n,]
+  clusters=suppressWarnings(Ckmeans.1d.dp::Ckmeans.1d.dp(feature.imp.m[1:n],c_low:c_high))
+  plot=ggplot2::ggplot(feature.imp,ggplot2::aes(x=factor(variables,levels=rev(variables)), 
+                                                y=coe,width=0.5),environment=environment())+
+    ggplot2::geom_bar(ggplot2::aes(fill=factor(clusters$cluster)),stat="identity",position="identity")+
+    ggplot2::coord_flip()+ggplot2::xlab("Features")+ggplot2::ggtitle("Feature importance")+
+    labs(fill = "Cluster")+
+    ggplot2::theme(plot.title=ggplot2::element_text(lineheight=0.9,face="bold"),
+                   panel.grid.major.y=ggplot2::element_blank())
+  return(plot)
+}
+```
+
+```{r}
+svm.feature.imp.plot(svm_mod,30,1,5)
+```
+

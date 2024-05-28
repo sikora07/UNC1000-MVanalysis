@@ -1,0 +1,1276 @@
+---
+title: "Mortality Machine Learning Modelling"
+author: "Author: Tianyi Zhang, the University of Georgia"
+date: "2024-01-10"
+output:
+  bookdown::html_document2:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressMessages(library("dplyr"))
+suppressMessages(library("tidyverse"))
+suppressMessages(library("gam"))
+suppressMessages(library("MLeval"))
+suppressMessages(library("knitr"))
+suppressMessages(library("groupdata2"))
+suppressMessages(library("randomForest"))
+suppressMessages(library("caret"))
+suppressMessages(library("e1071"))
+suppressMessages(library("xgboost"))
+```
+
+```{r}
+data_full_filled = read.csv("mortality_data_preprocessed.csv")
+```
+
+# DVA methods with mean imputation for missing
+
+For those variables with missing values, we already imputed with mean values. However in the following tables it can be viewed that the following groups have the same missing structure, (HCT, HGB), (creatinine, bicarbonate, sodium). Hence, the missingness indicators for those could be combined
+
+```{r}
+data_full_filled%>%
+  dplyr::select(ind_miss_HGB_24h,ind_miss_HCT_24h)%>%
+  table()
+```
+
+```{r}
+data_full_filled%>%
+  dplyr::select(ind_miss_creatinine_24h,ind_miss_bicarbonate_24h)%>%
+  table()
+```
+
+```{r}
+data_full_filled%>%
+  dplyr::select(ind_miss_sodium_24h,ind_miss_creatinine_24h)%>%
+  table()
+```
+
+In the following cell, we modify the variables to the format we need.
+
+```{r}
+data_full_filled=data_full_filled%>%
+  mutate(Death_at_discharge=ifelse(Death_at_discharge=="alive","Alive","Death"),
+         Death_at_discharge=factor(Death_at_discharge,levels = c("Alive","Death")),
+         Sex=factor(Sex,levels=c("Female", "Male")),
+         ICU_Type=relevel(factor(ICU_Type),ref="Mixed"),
+         MeVe_24h=factor(MeVe_24h,levels=c("No","Yes")),
+         Admission_Diagnosis=relevel(factor(Admission_Diagnosis),ref="Other"),
+         CRRT_24h=factor(CRRT_24h,levels=c("No","Yes")),
+         Vasopressor_24h=factor(Vasopressor_24h,levels=c("No","Yes")),
+         ind_miss_Fluid_balance_24h=factor(ind_miss_Fluid_balance_24h,levels=c("No","Yes")),
+         ind_miss_heart_rate_24h=factor(ind_miss_heart_rate_24h,levels=c("No","Yes")),
+         ind_miss_SBP_24h=factor(ind_miss_SBP_24h,levels=c("No","Normal_Vasso","Abnormal_low_Vasso")),
+         lowest_SBP_24h=factor(lowest_SBP_24h,levels=c("Normal","Abnormal_low")),
+         ind_miss_temperature_24h=factor(ind_miss_temperature_24h,levels=c("No","Yes")),
+         ind_miss_pH_24h=factor(ind_miss_pH_24h,levels=c("No","Yes")),
+         extreme_pH_24h=factor(extreme_pH_24h,levels=c("Normal","Abnormal_low","Abnormal_high")),
+         ind_miss_bicarbonate_24h=factor(ind_miss_bicarbonate_24h,levels=c("No","Yes")),
+         ind_miss_creatinine_24h=factor(ind_miss_creatinine_24h,levels=c("No","Yes")),
+         ind_miss_blood_glucose_24h=factor(ind_miss_blood_glucose_24h,levels=c("No","Yes")),
+         ind_miss_WBC_24h=factor(ind_miss_WBC_24h,levels=c("No","Yes")),
+         ind_miss_lactate_24h=factor(ind_miss_lactate_24h,levels=c("No","Yes")),
+         ind_miss_potassium_24h=factor(ind_miss_potassium_24h,levels=c("No","Yes")),
+         ind_miss_sodium_24h=factor(ind_miss_sodium_24h,levels=c("No","Yes")),
+         ind_miss_albumin_24h=factor(ind_miss_albumin_24h,levels=c("No","Yes")),
+         ind_miss_HGB_24h=factor(ind_miss_HGB_24h,levels=c("No","Yes_Female","Yes_Male")),
+         ind_miss_HCT_24h=factor(ind_miss_HCT_24h,levels=c("No","Yes_Female","Yes_Male")),
+         ind_miss_PLT_24h=factor(ind_miss_PLT_24h,levels=c("No","Yes")),
+         ind_miss_PaO2_over_FiO2_24h=factor(ind_miss_PaO2_over_FiO2_24h,levels=c("No","Yes")),
+         lowest_PaO2_over_FiO2_24h=factor(lowest_PaO2_over_FiO2_24h,levels=c("No_ARDS","Mild_ARDS",
+                                                                             "Moderate_ARDS",
+                                                                             "Severe_ARDS")),
+         MeVe=factor(MeVe,levels=c("No","Yes"))
+         )%>%
+  rename(ind_miss_HGB_HCT_24h=ind_miss_HGB_24h,
+         ind_miss_bicarbonate_creatinine_sodium_24h=ind_miss_bicarbonate_24h)%>%
+  dplyr::select(-ind_miss_HCT_24h,-ind_miss_creatinine_24h,
+                -ind_miss_sodium_24h)
+#In the last several rows, we combined the missingness indicators for those variables with the same missing structure.
+```
+
+In the following cell, we split samples into training and test sets with ratio 4:1.
+
+```{r}
+set.seed(20230717)
+train_data=data_full_filled%>% 
+  sample_frac(0.80)
+test_data=anti_join(data_full_filled,train_data,by="PATIENT_DEID")
+```
+
+# Linear Regression
+
+```{r, warning=FALSE}
+#The full logistic regression model is fitted on the training set first.
+logistic_linear=glm(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+                    data=train_data,
+                    family = binomial)
+
+#Stepwise selection is performed then
+#The following code is using AIC criterion
+#Un-comment the row "#,k=log(nrow(train_data))" will change it to BIC criterion
+logistic_linear_both=stats::step(logistic_linear,direction="both",trace=0
+                          #,k=log(nrow(train_data))
+                          )
+
+#With the final model, the logistic regression model is then trained again on training set
+logistic_linear_both_formu=formula(logistic_linear_both)
+logistic_linear_both=glm(logistic_linear_both_formu,
+                         data=train_data,
+                         family = binomial)
+
+#Prediction results on training set and test set are performed then.
+logistic_linear_both_pred_train=predict(logistic_linear_both,type="response")
+
+preds.death.train = data.frame(Death = logistic_linear_both_pred_train,
+                               Alive = 1-logistic_linear_both_pred_train,
+                               obs = train_data$Death_at_discharge,
+                               Group = "Linear Logistic")
+
+logistic_linear_both_pred_test=predict(logistic_linear_both,test_data,type="response")
+
+preds.death=data.frame(Death = logistic_linear_both_pred_test,
+                       Alive = 1-logistic_linear_both_pred_test,
+                       obs = test_data$Death_at_discharge,
+                       Group = "Linear Logistic")
+```
+
+# Nature Cubic Splines
+
+```{r, warning = F}
+#The full Nature Cubic Splines regression model is fitted on the training set first.
+#Nature splines are implemented using "ns" function.
+logistic_ns=glm(Death_at_discharge ~ns(APACHE_24h,df=3,knots=c(8.5,16.5)) + SOFA_24h + 
+                  ns(Age,df=3,knots=c(50,66)) + Sex + 
+                  ns(MRC_24h,df=3,knots=c(10.5,19)) + ICU_Type + MeVe_24h + 
+                  ind_miss_Fluid_balance_24h + ns(Fluid_balance_24h,df=3,knots=c(-0.2,2.0)) + 
+                  Admission_Diagnosis + CRRT_24h + Vasopressor_24h +
+                  ind_miss_heart_rate_24h + ns(highest_heart_rate_24h,df=3,knots=c(91,118)) + 
+                  ind_miss_SBP_24h + lowest_SBP_24h + 
+                  ind_miss_temperature_24h + ns(extreme_temperature_24h,df=3,knots=c(97.7,99.6)) + 
+                  ind_miss_pH_24h + extreme_pH_24h + 
+                  ind_miss_bicarbonate_creatinine_sodium_24h + 
+                  ns(extreme_bicarbonate_24h,df=3,knots=c(24.5,28.4)) + 
+                  ns(highest_creatinine_24h,df=3,knots=c(1.2,2.2)) + 
+                  ind_miss_blood_glucose_24h + ns(extreme_blood_glucose_24h,df=3,knots=c(103,171)) + 
+                  ind_miss_WBC_24h + ns(extreme_WBC_24h,df=3,knots=c(8.6,14.3)) + 
+                  ind_miss_lactate_24h + ns(highest_lactate_24h,df=3,knots=c(1.5)) + 
+                  ind_miss_potassium_24h + ns(extreme_potassium_24h,df=3,knots=c(3.75,4.45)) + 
+                  ns(extreme_sodium_24h,df=3,knots=c(136,144.4)) + 
+                  ind_miss_albumin_24h + ns(lowest_albumin_24h,df=3,knots=c(3.98)) + 
+                  ind_miss_HGB_HCT_24h + ns(lowest_HGB_24h,df=3,knots=c(12.5,14.1)) + 
+                  ns(lowest_HCT_24h,df=3,knots=c(40.6,42.4)) + 
+                  ind_miss_PLT_24h + ns(extreme_PLT_24h,df=3,knots=c(115,292)) + 
+                  ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+                data=train_data,family=binomial)
+
+#Stepwise selection is performed then
+#The following code is using AIC criterion
+#Un-comment the row "#,k=log(nrow(train_data))" will change it to BIC criterion
+logistic_ns_both=step(logistic_ns,direction="both",trace=0
+                      #,k=log(nrow(train_data))
+                      )
+
+#With the final model, the logistic nature cubic spline model is then trained again on training set.
+logistic_ns_both_formu=formula(logistic_ns_both)
+logistic_ns_both=glm(logistic_ns_both_formu,
+                     data=train_data,
+                     family = binomial)
+
+#Prediction results on training set and test set are performed then.
+logistic_ns_both_pred_train=predict(logistic_ns_both,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_ns_both_pred_train,
+                                     Alive = 1-logistic_ns_both_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Nature Cubic Splines Logistic")
+                          )
+
+logistic_ns_both_pred_test=predict(logistic_ns_both,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_ns_both_pred_test,
+                             Alive = 1-logistic_ns_both_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Nature Cubic Splines Logistic")
+                  )
+```
+
+In the following cell, a function to perform "approximate" BIC stepwise selection for "GAM" model is defined. This function is defined similarly with the function "step.Gam" in package "gam". Since this is not directly from Bayesian analysis, I would rather name it as "approximate" BIC criterion. Instead, consider the BIC criterion involves more penalty in non-sparsity as the sample size increase. We also add the penalty of "(k-2)*(n+1-df.resid)", where k is the model size, n is the sample size and df.resid is the degrees of freedom in residuals. In this function, if k.penal=2, it is simply AIC criterion.
+
+```{r}
+Step.Gam.bic=function (object, scope, scale, direction = c("both", "backward", 
+    "forward"), trace = TRUE, keep = NULL, steps = 1000, parallel = FALSE, k.penal=2,
+    ...) 
+{
+    trace = as.numeric(trace)
+    get.visit <- function(trial, visited) {
+        match(paste(trial, collapse = ""), apply(visited, 2, 
+            paste, collapse = ""), FALSE)
+    }
+    deviancelm <- function(object, ...) if (is.null(w <- object$weights)) 
+        sum(object$residuals^2)
+    else sum(w * object$residuals^2)
+    scope.char <- function(formula) {
+        formula = update(formula, ~-1 + .)
+        tt <- terms(formula)
+        tl <- attr(tt, "term.labels")
+        if (attr(tt, "intercept")) 
+            c("1", tl)
+        else tl
+    }
+    re.arrange <- function(keep) {
+        namr <- names(k1 <- keep[[1]])
+        namc <- names(keep)
+        nc <- length(keep)
+        nr <- length(k1)
+        array(unlist(keep, recursive = FALSE), c(nr, nc), list(namr, 
+            namc))
+    }
+    untangle.scope <- function(terms, regimens) {
+        a <- attributes(terms)
+        response <- deparse(a$variables[[2]])
+        term.labels <- a$term.labels
+        if (!is.null(a$offset)) {
+            off1 <- deparse(a$variables[[a$offset]])
+        }
+        nt <- length(regimens)
+        select <- integer(nt)
+        for (i in seq(nt)) {
+            j <- match(regimens[[i]], term.labels, 0)
+            if (any(j)) {
+                if (sum(j > 0) > 1) 
+                  stop(paste("The elements of a regimen", i, 
+                    "appear more than once in the initial model", 
+                    sep = " "))
+                select[i] <- seq(j)[j > 0]
+                term.labels <- term.labels[-sum(j)]
+            }
+            else {
+                if (!(j <- match("1", regimens[[i]], 0))) 
+                  stop(paste("regimen", i, "does not appear in the initial model", 
+                    sep = " "))
+                select[i] <- j
+            }
+        }
+        if (length(term.labels)) 
+            term.labels <- paste(term.labels, "+")
+        if (!is.null(a$offset)) 
+            term.labels <- paste(off1, term.labels, sep = " + ")
+        return(list(response = paste(response, term.labels, sep = " ~ "), 
+            select = select))
+    }
+    make.step <- function(models, fit, scale, object) {
+        chfrom <- sapply(models, "[[", "from")
+        chfrom[chfrom == "1"] <- ""
+        chto <- sapply(models, "[[", "to")
+        chto[1] = "<start>"
+        chto[chto == "1"] <- ""
+        dev <- sapply(models, "[[", "deviance")
+        df <- sapply(models, "[[", "df.resid")
+        ddev <- c(NA, diff(dev))
+        ddf <- c(NA, diff(df))
+        AIC <- sapply(models, "[[", "AIC")
+        heading <- c("Stepwise Model Path \nAnalysis of Deviance Table", 
+            "\nInitial Model:", deparse(as.vector(formula(object))), 
+            "\nFinal Model:", deparse(as.vector(formula(fit))), 
+            paste("\nScale: ", format(scale), "\n", sep = ""))
+        aod <- data.frame(From = chfrom, To = chto, Df = ddf, 
+            Deviance = ddev, `Resid. Df` = df, `Resid. Dev` = dev, 
+            AIC = AIC, check.names = FALSE)
+        aod <- as.anova(aod, heading)
+        class(aod) = c("stepanova", "data.frame")
+        fit$anova = aod
+        fit
+    }
+    direction <- match.arg(direction)
+    if (missing(scope)) 
+        stop("you must supply a scope argument to Step.Gam.bic(); the gam.scope() function might be useful")
+    if (!is.character(scope[[1]])) 
+        scope <- lapply(scope, scope.char)
+    response <- untangle.scope(object$terms, scope)
+    form.y <- response$response
+    backward <- direction == "both" | direction == "backward"
+    forward <- direction == "both" | direction == "forward"
+    items <- response$select
+    family <- family(object)
+    Call <- object$call
+    term.lengths <- sapply(scope, length)
+    n.items <- length(items)
+    visited <- matrix(items)
+    form.vector <- character(n.items)
+    for (i in seq(n.items)) form.vector[i] <- scope[[i]][items[i]]
+    form <- deparse(object$formula)
+    if (trace > 0) 
+        cat("Start: ", form)
+    fit <- object
+    n <- length(fit$fitted)
+    if (missing(scale)) {
+        famname <- family$family["name"]
+        scale <- switch(famname, Poisson = 1, Binomial = 1, deviancelm(fit)/fit$df.resid)
+    }
+    else if (scale == 0) 
+        scale <- deviancelm(fit)/fit$df.resid
+    bAIC <- fit$aic+(k.penal-2)*(n-fit$df.resid+1)
+    if (trace > 0) 
+        cat("; AIC=", format(round(bAIC, 4)), "\n")
+    models <- list(list(deviance = deviance(fit), df.resid = fit$df.resid, 
+        AIC = bAIC, from = "", to = ""))
+    if (!is.null(keep)) {
+        keep.list <- list(keep(fit, ...))
+        keep.it = TRUE
+    }
+    else keep.it = FALSE
+    AIC <- bAIC + 1
+    stepnum = 0
+    while (bAIC < AIC & steps > 0) {
+        steps <- steps - 1
+        stepnum = stepnum + 1
+        AIC <- bAIC
+        form.list = NULL
+        for (i in seq(n.items)) {
+            if (backward) {
+                trial <- items
+                trial[i] <- trial[i] - 1
+                if (trial[i] > 0 && !get.visit(trial, visited)) {
+                  visited <- cbind(visited, trial)
+                  tform.vector <- form.vector
+                  tform.vector[i] <- scope[[i]][trial[i]]
+                  form.list = c(form.list, list(list(trial = trial, 
+                    form.vector = tform.vector, which = i)))
+                }
+            }
+            if (forward) {
+                trial <- items
+                trial[i] <- trial[i] + 1
+                if (trial[i] <= term.lengths[i] && !get.visit(trial, 
+                  visited)) {
+                  visited <- cbind(visited, trial)
+                  tform.vector <- form.vector
+                  tform.vector[i] <- scope[[i]][trial[i]]
+                  form.list = c(form.list, list(list(trial = trial, 
+                    form.vector = tform.vector, which = i)))
+                }
+            }
+        }
+        if (is.null(form.list)) 
+            break
+        if (parallel) {
+            step.list = foreach(i = 1:length(form.list), .inorder = FALSE, 
+                .verbose = trace > 1) %dopar% {
+                tform = paste(form.y, paste(form.list[[i]]$form.vector, 
+                  collapse = " + "))
+                update(object, eval(parse(text = tform)), trace = FALSE, 
+                  ...)
+            }
+        }
+        else {
+            step.list = as.list(sequence(length(form.list)))
+            for (i in 1:length(form.list)) {
+                tform = paste(form.y, paste(form.list[[i]]$form.vector, 
+                  collapse = " + "))
+                step.list[[i]] = update(object, eval(parse(text = tform)), 
+                  trace = FALSE, ...)
+                if (trace > 1) 
+                  cat("Trial: ", tform, "; AIC=", format(round(step.list[[i]]$aic
+                                                               +(k.penal-2)*(n+1-step.list[[i]]$df.resid), 
+                    4)), "\n")
+            }
+        }
+        taic.vec = sapply(step.list, "[[", "aic") + (k.penal-2)*(n+1-sapply(step.list, "[[", "df.residual"))
+        if (keep.it) 
+            keep.list = c(keep.list, lapply(step.list, keep, 
+                ...))
+        bAIC = min(taic.vec)
+        if (bAIC >= AIC | steps == 0) {
+            if (keep.it) 
+                fit$keep <- re.arrange(keep.list)
+            return(make.step(models, fit, scale, object))
+        }
+        else {
+            o1 = order(taic.vec)[1]
+            fit = step.list[[o1]]
+            form.list = form.list[[o1]]
+            bwhich = form.list$which
+            bfrom = form.vector[bwhich]
+            form.vector = form.list$form.vector
+            bto = form.vector[bwhich]
+            if (trace > 0) 
+                cat(paste("Step:", stepnum, sep = ""), deparse(fit$formula), 
+                  "; AIC=", format(round(bAIC, 4)), "\n")
+            items <- form.list$trial
+            models <- c(models, list(list(deviance = deviance(fit), 
+                df.resid = fit$df.resid, AIC = bAIC, from = bfrom, 
+                to = bto)))
+        }
+    }
+}
+```
+
+# Smoothing splines
+
+```{r, warning = F}
+#The full Smoothing Splines regression model is fitted on the training set first.
+#Smoothing splines are implemented using "gam" function and "s" function.
+logistic_ss=gam(Death_at_discharge ~ SOFA_24h + s(APACHE_24h, df=5) + s(Age,df=5) + 
+                  s(MRC_24h, df=5) + s(Fluid_balance_24h,df=5) + 
+                  s(highest_heart_rate_24h,df=5) + s(extreme_temperature_24h,df=5) +
+                  s(extreme_bicarbonate_24h,df=5) + s(highest_creatinine_24h,df=5) +
+                  s(extreme_blood_glucose_24h, df=5) + s(extreme_WBC_24h,df=5) +
+                  s(highest_lactate_24h,df=5) + s(extreme_potassium_24h,df=5) + 
+                  s(extreme_sodium_24h,df=5) + s(lowest_albumin_24h,df=5) + 
+                  s(lowest_HGB_24h,df=5) + s(lowest_HCT_24h,df=5) + 
+                  s(extreme_PLT_24h,df=5) +
+                  Sex + ICU_Type + MeVe_24h + Admission_Diagnosis + 
+                  CRRT_24h + Vasopressor_24h + lowest_SBP_24h + extreme_pH_24h +
+                  lowest_PaO2_over_FiO2_24h + 
+                  ind_miss_Fluid_balance_24h + ind_miss_heart_rate_24h +
+                  ind_miss_SBP_24h + ind_miss_temperature_24h + 
+                  ind_miss_pH_24h + ind_miss_bicarbonate_creatinine_sodium_24h+
+                  ind_miss_blood_glucose_24h + ind_miss_WBC_24h +
+                  ind_miss_lactate_24h + ind_miss_potassium_24h + 
+                  ind_miss_albumin_24h + ind_miss_HGB_HCT_24h +
+                  ind_miss_PLT_24h + ind_miss_PaO2_over_FiO2_24h,
+                data=train_data,family=binomial)
+
+#The following scope_list specifies the "range" of the model, which is needed to be considered in stepwise selection.
+
+#Among all continuous variables, we consider only linear term for SOFA_24h. 
+#This can be viewed by some basic analysis for SOFA v.s. Mortality rate.
+scope_list = list(
+  "SOFA_24h" = ~1 + SOFA_24h,
+  "APACHE_24h" = ~1 + APACHE_24h + s(APACHE_24h, df=2) + s(APACHE_24h, df=3) + 
+    s(APACHE_24h, df =4) + s(APACHE_24h, df=5),
+  "Age" = ~1 + Age + s(Age, df=2) + s(Age, df=3) + s(Age, df =4) + s(Age, df=5),
+  "MRC_24h" = ~1 + MRC_24h + s(MRC_24h, df=2) + s(MRC_24h, df=3) + s(MRC_24h, df =4) + 
+    s(MRC_24h, df=5),
+  "Fluid_balance_24h" = ~1 + Fluid_balance_24h + s(Fluid_balance_24h, df=2) + s(Fluid_balance_24h, df=3) +
+    s(Fluid_balance_24h, df =4) + s(Fluid_balance_24h, df=5),
+  "highest_heart_rate_24h" = ~1 + highest_heart_rate_24h + s(highest_heart_rate_24h, df=2) +
+    s(highest_heart_rate_24h, df=3) + s(highest_heart_rate_24h, df =4) + s(highest_heart_rate_24h, df=5),
+  "extreme_temperature_24h" = ~1 + extreme_temperature_24h + s(extreme_temperature_24h, df=2) +
+    s(extreme_temperature_24h, df=3) + s(extreme_temperature_24h, df =4) + s(extreme_temperature_24h, df=5),
+  "extreme_bicarbonate_24h" = ~1 + extreme_bicarbonate_24h + s(extreme_bicarbonate_24h, df=2) +
+    s(extreme_bicarbonate_24h, df=3) + s(extreme_bicarbonate_24h, df =4) + s(extreme_bicarbonate_24h, df=5),
+  "highest_creatinine_24h" = ~1 + highest_creatinine_24h + s(highest_creatinine_24h, df=2) +
+    s(highest_creatinine_24h, df=3) + s(highest_creatinine_24h, df =4) + s(highest_creatinine_24h, df=5),
+  "extreme_blood_glucose_24h" = ~1 + extreme_blood_glucose_24h + s(extreme_blood_glucose_24h, df=2) +
+    s(extreme_blood_glucose_24h, df=3) + s(extreme_blood_glucose_24h, df =4) + s(extreme_blood_glucose_24h, df=5),
+  "extreme_WBC_24h" = ~1 + extreme_WBC_24h + s(extreme_WBC_24h, df=2) + s(extreme_WBC_24h, df=3) +
+    s(extreme_WBC_24h, df =4) + s(extreme_WBC_24h, df=5),
+  "highest_lactate_24h" = ~1 + highest_lactate_24h + s(highest_lactate_24h, df=2) + 
+    s(highest_lactate_24h, df=3) + s(highest_lactate_24h, df =4) + s(highest_lactate_24h, df=5),
+  "extreme_potassium_24h" = ~1 + extreme_potassium_24h + s(extreme_potassium_24h, df=2) + 
+    s(extreme_potassium_24h, df=3) + s(extreme_potassium_24h, df =4) + s(extreme_potassium_24h, df=5),
+  "extreme_sodium_24h" = ~1 + extreme_sodium_24h + s(extreme_sodium_24h, df=2) + s(extreme_sodium_24h, df=3) +
+    s(extreme_sodium_24h, df =4) + s(extreme_sodium_24h, df=5),
+  "lowest_albumin_24h" = ~1 + lowest_albumin_24h + s(lowest_albumin_24h, df=2) + s(lowest_albumin_24h, df=3) +
+    s(lowest_albumin_24h, df =4) + s(lowest_albumin_24h, df=5),
+  "lowest_HGB_24h" = ~1 + lowest_HGB_24h + s(lowest_HGB_24h, df=2) + s(lowest_HGB_24h, df=3) + 
+    s(lowest_HGB_24h, df =4) + s(lowest_HGB_24h, df=5),
+  "lowest_HCT_24h" = ~1 + lowest_HCT_24h + s(lowest_HCT_24h, df=2) + s(lowest_HCT_24h, df=3) + 
+    s(lowest_HCT_24h, df =4) + s(lowest_HCT_24h, df=5),
+  "extreme_PLT_24h" = ~1 + extreme_PLT_24h + s(extreme_PLT_24h, df=2) + s(extreme_PLT_24h, df=3) +
+    s(extreme_PLT_24h, df =4) + s(extreme_PLT_24h, df=5),
+  
+  "Sex"= ~1 + Sex,
+  "ICU_Type"= ~1 + ICU_Type,
+  "MeVe_24h"= ~1 + MeVe_24h,
+  "Admission_Diagnosis"= ~1 + Admission_Diagnosis,
+  "CRRT_24h"= ~1 + CRRT_24h,
+  "Vasopressor_24h"= ~1 + Vasopressor_24h,
+  "lowest_SBP_24h" = ~1 + lowest_SBP_24h,
+  "extreme_pH_24h"= ~1 + extreme_pH_24h,
+  "lowest_PaO2_over_FiO2_24h"= ~1 + lowest_PaO2_over_FiO2_24h,
+  
+  "ind_miss_Fluid_balance_24h"= ~1 + ind_miss_Fluid_balance_24h,
+  "ind_miss_heart_rate_24h"= ~1 + ind_miss_heart_rate_24h,
+  "ind_miss_SBP_24h"= ~1 + ind_miss_SBP_24h,
+  "ind_miss_temperature_24h"= ~1 + ind_miss_temperature_24h,
+  "ind_miss_pH_24h"= ~1 + ind_miss_pH_24h,
+  "ind_miss_bicarbonate_creatinine_sodium_24h"= ~1 + ind_miss_bicarbonate_creatinine_sodium_24h,
+  "ind_miss_blood_glucose_24h"= ~1 + ind_miss_blood_glucose_24h,
+  "ind_miss_WBC_24h"= ~1 + ind_miss_WBC_24h,
+  "ind_miss_lactate_24h"= ~1 + ind_miss_lactate_24h,
+  "ind_miss_potassium_24h"= ~1 + ind_miss_potassium_24h,
+  "ind_miss_albumin_24h"= ~1 + ind_miss_albumin_24h,
+  "ind_miss_HGB_HCT_24h"= ~1 + ind_miss_HGB_HCT_24h,
+  "ind_miss_PLT_24h"= ~1 + ind_miss_PLT_24h,
+  "ind_miss_PaO2_over_FiO2_24h"= ~1 + ind_miss_PaO2_over_FiO2_24h
+  )
+
+#Stepwise selection is performed then
+#The following code is using AIC criterion
+#Un-comment the row "#,k.penal=log(nrow(train_data))" will change it to BIC criterion
+logistic_ss_both=Step.Gam.bic(logistic_ss,scope=scope_list,direction="both",trace=0
+                              #,k.penal=log(nrow(train_data))
+                              )
+
+#With the final model, the logistic smoothing spline model is then trained again on training set.
+logistic_ss_both_formu=formula(logistic_ss_both)
+logistic_ss_both=gam(logistic_ss_both_formu,
+                     data=train_data,
+                     family = binomial)
+
+#Prediction results on training set and test set are performed then.
+logistic_ss_both_pred_train=predict(logistic_ss_both,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_ss_both_pred_train,
+                                     Alive = 1-logistic_ss_both_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Smoothing Splines Logistic")
+                          )
+
+logistic_ss_both_pred_test=predict(logistic_ss_both,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_ss_both_pred_test,
+                             Alive = 1-logistic_ss_both_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Smoothing Splines Logistic")
+                  )
+```
+
+# Local linear regression
+
+In the following cell, we add cross validation for "span" parameter for local linear regression. "span" is used to determine how many data should be used to estimate the parameters in the regression at any given values for the variables.
+
+```{r}
+#In this cell, training set is splited into 5 folds.
+data.train=train_data%>%
+  mutate(ICU_Type=as.character(ICU_Type))%>%
+  mutate(ICU_Type=ifelse(ICU_Type%in%c("Mixed","Cardiothoracic Surgery"),"Mixed",ICU_Type))%>%
+  mutate(ICU_Type=relevel(factor(ICU_Type),ref="Mixed"))
+
+set.seed(12345)
+
+data.train = fold(
+  data.train%>%
+    mutate(PATIENT_DEID=factor(PATIENT_DEID)),
+  k = 5,
+  cat_col = "Death_at_discharge",
+  id_col = "PATIENT_DEID",
+  parallel = FALSE # set to TRUE to run in parallel
+  )
+```
+
+```{r, warning=FALSE}
+#Treat "span" as a hyperparameter, we use cross validation scheme to select the best parameter.
+span.grid=seq(0.1,0.9,0.1)
+AUROC.matrix=matrix(NA,length(span.grid),5)
+
+for (span.id in 1:length(span.grid)){
+  span.i=span.grid[span.id]
+  AUROC.i=c()
+  for (nfold in 1:5){
+    #In each fold, we fit the model on the specific training set in the whole training set.
+    data.train.i=data.train%>%
+      filter(.folds!=nfold)
+    data.test.i=data.train%>%
+      filter(.folds==nfold)
+    
+    #Since indicator of missingness for WBC is very similar with that of HGB and HCT, 
+    #we need consider whether those two vector could be coincidently the same in the training set. 
+    #If they become the same, we just need use one of them, otherwise, both of them could be both included in the model.
+    if (sum((data.train.i%>%ungroup()%>%
+             dplyr::select(ind_miss_WBC_24h,ind_miss_HGB_HCT_24h)%>%
+             table())==0)==3){
+      logistic_ll.i=gam(Death_at_discharge ~ SOFA_24h + lo(APACHE_24h,degree=1,span=span.i) + 
+                  lo(Age,degree=1,span=span.i) + lo(MRC_24h,degree=1,span=span.i) +
+                  lo(Fluid_balance_24h,degree=1,span=span.i) + 
+                  lo(highest_heart_rate_24h,degree=1,span=span.i) + 
+                  lo(extreme_temperature_24h,degree=1,span=span.i) +
+                  lo(extreme_bicarbonate_24h,degree=1,span=span.i) + 
+                  lo(highest_creatinine_24h,degree=1,span=span.i) +
+                  lo(extreme_blood_glucose_24h,degree=1,span=span.i) + 
+                  lo(extreme_WBC_24h,degree=1,span=span.i) +
+                  lo(highest_lactate_24h,degree=1,span=span.i) + 
+                  lo(extreme_potassium_24h,degree=1,span=span.i) + 
+                  lo(extreme_sodium_24h,degree=1,span=span.i) + 
+                  lo(lowest_albumin_24h,degree=1,span=span.i) + 
+                  lo(lowest_HGB_24h,degree=1,span=span.i) + 
+                  lo(lowest_HCT_24h,degree=1,span=span.i) + 
+                  lo(extreme_PLT_24h,degree=1,span=span.i) +
+                  Sex + ICU_Type + MeVe_24h + Admission_Diagnosis + 
+                  CRRT_24h + Vasopressor_24h + lowest_SBP_24h + extreme_pH_24h +
+                  lowest_PaO2_over_FiO2_24h + 
+                  ind_miss_Fluid_balance_24h + ind_miss_heart_rate_24h +
+                  ind_miss_SBP_24h + ind_miss_temperature_24h + 
+                  ind_miss_pH_24h + ind_miss_bicarbonate_creatinine_sodium_24h+
+                  ind_miss_blood_glucose_24h + 
+                  ind_miss_lactate_24h + ind_miss_potassium_24h + 
+                  ind_miss_albumin_24h + ind_miss_HGB_HCT_24h +
+                  ind_miss_PLT_24h + ind_miss_PaO2_over_FiO2_24h,
+                data=data.train.i,family=binomial)
+      #The following scope_list specifies the "range" of the model, which is needed to be considered in stepwise selection.
+      scope_list.i = list(
+      "SOFA_24h" = ~1 + SOFA_24h,
+      "APACHE_24h" = ~1 + APACHE_24h + lo(APACHE_24h,degree=1,span=span.i),
+      "Age" = ~1 + Age + lo(Age,degree=1,span=span.i),
+      "MRC_24h" = ~1 + MRC_24h + lo(MRC_24h,degree=1,span=span.i),
+      "Fluid_balance_24h" = ~1 + Fluid_balance_24h + lo(Fluid_balance_24h,degree=1,span=span.i),
+      "highest_heart_rate_24h" = ~1 + highest_heart_rate_24h + lo(highest_heart_rate_24h,degree=1,span=span.i),
+      "extreme_temperature_24h" = ~1 + extreme_temperature_24h + lo(extreme_temperature_24h,degree=1,span=span.i),
+      "extreme_bicarbonate_24h" = ~1 + extreme_bicarbonate_24h + lo(extreme_bicarbonate_24h,degree=1,span=span.i),
+      "highest_creatinine_24h" = ~1 + highest_creatinine_24h + lo(highest_creatinine_24h,degree=1,span=span.i),
+      "extreme_blood_glucose_24h" = ~1 + extreme_blood_glucose_24h +
+        lo(extreme_blood_glucose_24h,degree=1,span=span.i),
+      "extreme_WBC_24h" = ~1 + extreme_WBC_24h + lo(extreme_WBC_24h,degree=1,span=span.i),
+      "highest_lactate_24h" = ~1 + highest_lactate_24h + lo(highest_lactate_24h,degree=1,span=span.i),
+      "extreme_potassium_24h" = ~1 + extreme_potassium_24h + lo(extreme_potassium_24h,degree=1,span=span.i),
+      "extreme_sodium_24h" = ~1 + extreme_sodium_24h + lo(extreme_sodium_24h,degree=1,span=span.i),
+      "lowest_albumin_24h" = ~1 + lowest_albumin_24h + lo(lowest_albumin_24h,degree=1,span=span.i),
+      "lowest_HGB_24h" = ~1 + lowest_HGB_24h + lo(lowest_HGB_24h,degree=1,span=span.i),
+      "lowest_HCT_24h" = ~1 + lowest_HCT_24h + lo(lowest_HCT_24h,degree=1,span=span.i),
+      "extreme_PLT_24h" = ~1 + extreme_PLT_24h + lo(extreme_PLT_24h,degree=1,span=span.i),
+      
+      "Sex"= ~1 + Sex,
+      "ICU_Type"= ~1 + ICU_Type,
+      "MeVe_24h"= ~1 + MeVe_24h,
+      "Admission_Diagnosis"= ~1 + Admission_Diagnosis,
+      "CRRT_24h"= ~1 + CRRT_24h,
+      "Vasopressor_24h"= ~1 + Vasopressor_24h,
+      "lowest_SBP_24h" = ~1 + lowest_SBP_24h,
+      "extreme_pH_24h"= ~1 + extreme_pH_24h,
+      "lowest_PaO2_over_FiO2_24h"= ~1 + lowest_PaO2_over_FiO2_24h,
+      
+      "ind_miss_Fluid_balance_24h"= ~1 + ind_miss_Fluid_balance_24h,
+      "ind_miss_heart_rate_24h"= ~1 + ind_miss_heart_rate_24h,
+      "ind_miss_SBP_24h"= ~1 + ind_miss_SBP_24h,
+      "ind_miss_temperature_24h"= ~1 + ind_miss_temperature_24h,
+      "ind_miss_pH_24h"= ~1 + ind_miss_pH_24h,
+      "ind_miss_bicarbonate_creatinine_sodium_24h"= ~1 + ind_miss_bicarbonate_creatinine_sodium_24h,
+      "ind_miss_blood_glucose_24h"= ~1 + ind_miss_blood_glucose_24h,
+      "ind_miss_lactate_24h"= ~1 + ind_miss_lactate_24h,
+      "ind_miss_potassium_24h"= ~1 + ind_miss_potassium_24h,
+      "ind_miss_albumin_24h"= ~1 + ind_miss_albumin_24h,
+      "ind_miss_HGB_HCT_24h"= ~1 + ind_miss_HGB_HCT_24h,
+      "ind_miss_PLT_24h"= ~1 + ind_miss_PLT_24h,
+      "ind_miss_PaO2_over_FiO2_24h"= ~1 + ind_miss_PaO2_over_FiO2_24h
+      )
+    }else{
+      logistic_ll.i=gam(Death_at_discharge ~ SOFA_24h + lo(APACHE_24h,degree=1,span=span.i) + 
+                  lo(Age,degree=1,span=span.i) + lo(MRC_24h,degree=1,span=span.i) +
+                  lo(Fluid_balance_24h,degree=1,span=span.i) + 
+                  lo(highest_heart_rate_24h,degree=1,span=span.i) + 
+                  lo(extreme_temperature_24h,degree=1,span=span.i) +
+                  lo(extreme_bicarbonate_24h,degree=1,span=span.i) + 
+                  lo(highest_creatinine_24h,degree=1,span=span.i) +
+                  lo(extreme_blood_glucose_24h,degree=1,span=span.i) + 
+                  lo(extreme_WBC_24h,degree=1,span=span.i) +
+                  lo(highest_lactate_24h,degree=1,span=span.i) + 
+                  lo(extreme_potassium_24h,degree=1,span=span.i) + 
+                  lo(extreme_sodium_24h,degree=1,span=span.i) + 
+                  lo(lowest_albumin_24h,degree=1,span=span.i) + 
+                  lo(lowest_HGB_24h,degree=1,span=span.i) + 
+                  lo(lowest_HCT_24h,degree=1,span=span.i) + 
+                  lo(extreme_PLT_24h,degree=1,span=span.i) +
+                  Sex + ICU_Type + MeVe_24h + Admission_Diagnosis + 
+                  CRRT_24h + Vasopressor_24h + lowest_SBP_24h + extreme_pH_24h +
+                  lowest_PaO2_over_FiO2_24h + 
+                  ind_miss_Fluid_balance_24h + ind_miss_heart_rate_24h +
+                  ind_miss_SBP_24h + ind_miss_temperature_24h + 
+                  ind_miss_pH_24h + ind_miss_bicarbonate_creatinine_sodium_24h+
+                  ind_miss_blood_glucose_24h + ind_miss_WBC_24h +
+                  ind_miss_lactate_24h + ind_miss_potassium_24h + 
+                  ind_miss_albumin_24h + ind_miss_HGB_HCT_24h +
+                  ind_miss_PLT_24h + ind_miss_PaO2_over_FiO2_24h,
+                data=data.train.i,family=binomial)
+      #The following scope_list specifies the "range" of the model, which is needed to be considered in stepwise selection.
+      scope_list.i = list(
+      "SOFA_24h" = ~1 + SOFA_24h,
+      "APACHE_24h" = ~1 + APACHE_24h + lo(APACHE_24h,degree=1,span=span.i),
+      "Age" = ~1 + Age + lo(Age,degree=1,span=span.i),
+      "MRC_24h" = ~1 + MRC_24h + lo(MRC_24h,degree=1,span=span.i),
+      "Fluid_balance_24h" = ~1 + Fluid_balance_24h + lo(Fluid_balance_24h,degree=1,span=span.i),
+      "highest_heart_rate_24h" = ~1 + highest_heart_rate_24h + lo(highest_heart_rate_24h,degree=1,span=span.i),
+      "extreme_temperature_24h" = ~1 + extreme_temperature_24h + lo(extreme_temperature_24h,degree=1,span=span.i),
+      "extreme_bicarbonate_24h" = ~1 + extreme_bicarbonate_24h + lo(extreme_bicarbonate_24h,degree=1,span=span.i),
+      "highest_creatinine_24h" = ~1 + highest_creatinine_24h + lo(highest_creatinine_24h,degree=1,span=span.i),
+      "extreme_blood_glucose_24h" = ~1 + extreme_blood_glucose_24h +
+        lo(extreme_blood_glucose_24h,degree=1,span=span.i),
+      "extreme_WBC_24h" = ~1 + extreme_WBC_24h + lo(extreme_WBC_24h,degree=1,span=span.i),
+      "highest_lactate_24h" = ~1 + highest_lactate_24h + lo(highest_lactate_24h,degree=1,span=span.i),
+      "extreme_potassium_24h" = ~1 + extreme_potassium_24h + lo(extreme_potassium_24h,degree=1,span=span.i),
+      "extreme_sodium_24h" = ~1 + extreme_sodium_24h + lo(extreme_sodium_24h,degree=1,span=span.i),
+      "lowest_albumin_24h" = ~1 + lowest_albumin_24h + lo(lowest_albumin_24h,degree=1,span=span.i),
+      "lowest_HGB_24h" = ~1 + lowest_HGB_24h + lo(lowest_HGB_24h,degree=1,span=span.i),
+      "lowest_HCT_24h" = ~1 + lowest_HCT_24h + lo(lowest_HCT_24h,degree=1,span=span.i),
+      "extreme_PLT_24h" = ~1 + extreme_PLT_24h + lo(extreme_PLT_24h,degree=1,span=span.i),
+      
+      "Sex"= ~1 + Sex,
+      "ICU_Type"= ~1 + ICU_Type,
+      "MeVe_24h"= ~1 + MeVe_24h,
+      "Admission_Diagnosis"= ~1 + Admission_Diagnosis,
+      "CRRT_24h"= ~1 + CRRT_24h,
+      "Vasopressor_24h"= ~1 + Vasopressor_24h,
+      "lowest_SBP_24h" = ~1 + lowest_SBP_24h,
+      "extreme_pH_24h"= ~1 + extreme_pH_24h,
+      "lowest_PaO2_over_FiO2_24h"= ~1 + lowest_PaO2_over_FiO2_24h,
+      
+      "ind_miss_Fluid_balance_24h"= ~1 + ind_miss_Fluid_balance_24h,
+      "ind_miss_heart_rate_24h"= ~1 + ind_miss_heart_rate_24h,
+      "ind_miss_SBP_24h"= ~1 + ind_miss_SBP_24h,
+      "ind_miss_temperature_24h"= ~1 + ind_miss_temperature_24h,
+      "ind_miss_pH_24h"= ~1 + ind_miss_pH_24h,
+      "ind_miss_bicarbonate_creatinine_sodium_24h"= ~1 + ind_miss_bicarbonate_creatinine_sodium_24h,
+      "ind_miss_blood_glucose_24h"= ~1 + ind_miss_blood_glucose_24h,
+      "ind_miss_WBC_24h"= ~1 + ind_miss_WBC_24h,
+      "ind_miss_lactate_24h"= ~1 + ind_miss_lactate_24h,
+      "ind_miss_potassium_24h"= ~1 + ind_miss_potassium_24h,
+      "ind_miss_albumin_24h"= ~1 + ind_miss_albumin_24h,
+      "ind_miss_HGB_HCT_24h"= ~1 + ind_miss_HGB_HCT_24h,
+      "ind_miss_PLT_24h"= ~1 + ind_miss_PLT_24h,
+      "ind_miss_PaO2_over_FiO2_24h"= ~1 + ind_miss_PaO2_over_FiO2_24h
+      )
+    }
+    #Stepwise selection is performed then
+    #The following code is using AIC criterion
+    #Un-comment the row "#,k.penal=log(nrow(train_data))" will change it to BIC criterion
+    logistic_ll_both.i=Step.Gam.bic(logistic_ll.i,scope=scope_list.i,direction="both",trace=0
+                              #,k.penal=log(nrow(data.train.i))
+                              )
+    
+    #With the final model, the local linear model is then trained again on training set.
+    logistic_ll_both_formu.i=formula(logistic_ll_both.i)
+    logistic_ll_both.i=gam(logistic_ll_both_formu.i,
+                         data=data.train.i,
+                         family = binomial)
+    
+    #Prediction results on test set are performed then and AUROC is stored as the metric for selecting "span".
+    pred.i=predict(logistic_ll_both.i,data.test.i,type="response")
+    preds.death.i=data.frame(Death = pred.i,
+                             Alive = 1-pred.i,
+                             obs = data.test.i$Death_at_discharge,
+                             Group = "1")
+    test.i=evalm(preds.death.i, bins = 2, positive="Death")
+    AUROC.i=c(AUROC.i,test.i$optres[[1]][13,1])
+  }
+  AUROC.matrix[span.id,]=AUROC.i
+}
+```
+
+```{r}
+#With BIC criterion, you should get the results of AUROC metric as in the following one in comment.
+#AUROC.matrix=matrix(c(0.89,0.59,0.90,0.83,0.61,
+#                      0.55,0.82,0.95,0.83,0.77,
+#                      0.89,0.82,0.90,0.83,0.77,
+#                      0.89,0.82,0.90,0.83,0.77,
+#                      0.89,0.82,0.90,0.83,0.77,
+#                      0.89,0.82,0.90,0.84,0.77,
+#                      0.87,0.82,0.83,0.84,0.76,
+#                      0.87,0.82,0.90,0.84,0.76,
+#                      0.89,0.83,0.94,0.84,0.76),
+#                    length(span.grid),5,byrow=T)
+
+#Then the optimal "span" parameter could be found in the following code.
+best.span=span.grid[which.max(apply(AUROC.matrix,1,mean))]
+```
+
+With the optimal "span" parameter, we then perform similar process as in "smoothing splines".
+
+```{r, warning = F}
+#The full local linear regression model is fitted on the training set first.
+#local linear regressions are implemented using "gam" function and "lo" function.
+logistic_ll=gam(Death_at_discharge ~ SOFA_24h + lo(APACHE_24h,degree=1,span=best.span) + 
+                  lo(Age,degree=1,span=best.span) + lo(MRC_24h,degree=1,span=best.span) +
+                  lo(Fluid_balance_24h,degree=1,span=best.span) + 
+                  lo(highest_heart_rate_24h,degree=1,span=best.span) + 
+                  lo(extreme_temperature_24h,degree=1,span=best.span) +
+                  lo(extreme_bicarbonate_24h,degree=1,span=best.span) + 
+                  lo(highest_creatinine_24h,degree=1,span=best.span) +
+                  lo(extreme_blood_glucose_24h,degree=1,span=best.span) + 
+                  lo(extreme_WBC_24h,degree=1,span=best.span) +
+                  lo(highest_lactate_24h,degree=1,span=best.span) + 
+                  lo(extreme_potassium_24h,degree=1,span=best.span) + 
+                  lo(extreme_sodium_24h,degree=1,span=best.span) + 
+                  lo(lowest_albumin_24h,degree=1,span=best.span) + 
+                  lo(lowest_HGB_24h,degree=1,span=best.span) + 
+                  lo(lowest_HCT_24h,degree=1,span=best.span) + 
+                  lo(extreme_PLT_24h,degree=1,span=best.span) +
+                  Sex + ICU_Type + MeVe_24h + Admission_Diagnosis + 
+                  CRRT_24h + Vasopressor_24h + lowest_SBP_24h + extreme_pH_24h +
+                  lowest_PaO2_over_FiO2_24h +
+                  ind_miss_Fluid_balance_24h + ind_miss_heart_rate_24h +
+                  ind_miss_SBP_24h + ind_miss_temperature_24h + 
+                  ind_miss_pH_24h + ind_miss_bicarbonate_creatinine_sodium_24h+
+                  ind_miss_blood_glucose_24h + ind_miss_WBC_24h +
+                  ind_miss_lactate_24h + ind_miss_potassium_24h + 
+                  ind_miss_albumin_24h + ind_miss_HGB_HCT_24h +
+                  ind_miss_PLT_24h + ind_miss_PaO2_over_FiO2_24h,
+                data=train_data,family=binomial)
+
+#The following scope_list specifies the "range" of the model, which is needed to be considered in stepwise selection.
+
+#Among all continuous variables, we consider only linear term for SOFA_24h. 
+#This can be viewed by some basic analysis for SOFA v.s. Mortality rate.
+scope_list = list(
+  "SOFA_24h" = ~1 + SOFA_24h,
+  "APACHE_24h" = ~1 + APACHE_24h + lo(APACHE_24h,degree=1,span=best.span),
+  "Age" = ~1 + Age + lo(Age,degree=1,span=best.span),
+  "MRC_24h" = ~1 + MRC_24h + lo(MRC_24h,degree=1,span=best.span),
+  "Fluid_balance_24h" = ~1 + Fluid_balance_24h + lo(Fluid_balance_24h,degree=1,span=best.span),
+  "highest_heart_rate_24h" = ~1 + highest_heart_rate_24h + lo(highest_heart_rate_24h,degree=1,span=best.span),
+  "extreme_temperature_24h" = ~1 + extreme_temperature_24h + lo(extreme_temperature_24h,degree=1,span=best.span),
+  "extreme_bicarbonate_24h" = ~1 + extreme_bicarbonate_24h + lo(extreme_bicarbonate_24h,degree=1,span=best.span),
+  "highest_creatinine_24h" = ~1 + highest_creatinine_24h + lo(highest_creatinine_24h,degree=1,span=best.span),
+  "extreme_blood_glucose_24h" = ~1 + extreme_blood_glucose_24h +
+    lo(extreme_blood_glucose_24h,degree=1,span=best.span),
+  "extreme_WBC_24h" = ~1 + extreme_WBC_24h + lo(extreme_WBC_24h,degree=1,span=best.span),
+  "highest_lactate_24h" = ~1 + highest_lactate_24h + lo(highest_lactate_24h,degree=1,span=best.span),
+  "extreme_potassium_24h" = ~1 + extreme_potassium_24h + lo(extreme_potassium_24h,degree=1,span=best.span),
+  "extreme_sodium_24h" = ~1 + extreme_sodium_24h + lo(extreme_sodium_24h,degree=1,span=best.span),
+  "lowest_albumin_24h" = ~1 + lowest_albumin_24h + lo(lowest_albumin_24h,degree=1,span=best.span),
+  "lowest_HGB_24h" = ~1 + lowest_HGB_24h + lo(lowest_HGB_24h,degree=1,span=best.span),
+  "lowest_HCT_24h" = ~1 + lowest_HCT_24h + lo(lowest_HCT_24h,degree=1,span=best.span),
+  "extreme_PLT_24h" = ~1 + extreme_PLT_24h + lo(extreme_PLT_24h,degree=1,span=best.span),
+  
+  "Sex"= ~1 + Sex,
+  "ICU_Type"= ~1 + ICU_Type,
+  "MeVe_24h"= ~1 + MeVe_24h,
+  "Admission_Diagnosis"= ~1 + Admission_Diagnosis,
+  "CRRT_24h"= ~1 + CRRT_24h,
+  "Vasopressor_24h"= ~1 + Vasopressor_24h,
+  "lowest_SBP_24h" = ~1 + lowest_SBP_24h,
+  "extreme_pH_24h"= ~1 + extreme_pH_24h,
+  "lowest_PaO2_over_FiO2_24h"= ~1 + lowest_PaO2_over_FiO2_24h,
+  
+  "ind_miss_Fluid_balance_24h"= ~1 + ind_miss_Fluid_balance_24h,
+  "ind_miss_heart_rate_24h"= ~1 + ind_miss_heart_rate_24h,
+  "ind_miss_SBP_24h"= ~1 + ind_miss_SBP_24h,
+  "ind_miss_temperature_24h"= ~1 + ind_miss_temperature_24h,
+  "ind_miss_pH_24h"= ~1 + ind_miss_pH_24h,
+  "ind_miss_bicarbonate_creatinine_sodium_24h"= ~1 + ind_miss_bicarbonate_creatinine_sodium_24h,
+  "ind_miss_blood_glucose_24h"= ~1 + ind_miss_blood_glucose_24h,
+  "ind_miss_WBC_24h"= ~1 + ind_miss_WBC_24h,
+  "ind_miss_lactate_24h"= ~1 + ind_miss_lactate_24h,
+  "ind_miss_potassium_24h"= ~1 + ind_miss_potassium_24h,
+  "ind_miss_albumin_24h"= ~1 + ind_miss_albumin_24h,
+  "ind_miss_HGB_HCT_24h"= ~1 + ind_miss_HGB_HCT_24h,
+  "ind_miss_PLT_24h"= ~1 + ind_miss_PLT_24h,
+  "ind_miss_PaO2_over_FiO2_24h"= ~1 + ind_miss_PaO2_over_FiO2_24h
+  )
+
+#Stepwise selection is performed then
+#The following code is using AIC criterion
+#Un-comment the row "#,k.penal=log(nrow(train_data))" will change it to BIC criterion
+logistic_ll_both=Step.Gam.bic(logistic_ll,scope=scope_list,direction="both",trace=0
+                              #,k.penal=log(nrow(train_data))
+                              )
+
+#With the final model, the local linear model is then trained again on training set.
+logistic_ll_both_formu=formula(logistic_ll_both)
+logistic_ll_both=gam(logistic_ll_both_formu,
+                     data=train_data,
+                     family = binomial)
+
+#Prediction results on training set and test set are performed then.
+logistic_ll_both_pred_train=predict(logistic_ll_both,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_ll_both_pred_train,
+                                     Alive = 1-logistic_ll_both_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Local Linear Logistic")
+                          )
+
+logistic_ll_both_pred_test=predict(logistic_ll_both,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_ll_both_pred_test,
+                             Alive = 1-logistic_ll_both_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Local Linear Logistic")
+                  )
+```
+
+# Linear Regression: MRCICU + SOFA + APACHE II
+
+```{r, warning=FALSE}
+#The logistic regression model with the three above predictors is fitted on the training set first.
+logistic_linear_prev=glm(Death_at_discharge~APACHE_24h + SOFA_24h + MRC_24h,
+                         data=train_data,
+                         family = binomial)
+
+#Prediction results on training set and test set are performed then.
+logistic_linear_prev_pred_train=predict(logistic_linear_prev,type="response")
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = logistic_linear_prev_pred_train,
+                                     Alive = 1-logistic_linear_prev_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "MRCICU + SOFA + APACHE II")
+                          )
+
+logistic_linear_prev_pred_test=predict(logistic_linear_prev,test_data,type="response")
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = logistic_linear_prev_pred_test,
+                             Alive = 1-logistic_linear_prev_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "MRCICU + SOFA + APACHE II")
+                  )
+```
+
+# Random Forest
+
+Two parameters are tuned for Random forest, which are number of trees, and number of variables randomly sampled as candidates at each split.
+
+```{r}
+#This is a customized random forest where we may do parameter selection for "mtry"
+customRF <- list(type = "Classification", library = "randomForest", loop = NULL)
+customRF$parameters <- data.frame(parameter = c("mtry", "ntree"), class = rep("numeric", 2), label = c("mtry", "ntree"))
+customRF$grid <- function(x, y, len = NULL, search = "grid") {}
+customRF$fit <- function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+  randomForest(x, y, mtry = param$mtry, ntree=param$ntree, ...)
+}
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+   predict(modelFit, newdata)
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL)
+   predict(modelFit, newdata, type = "prob")
+customRF$sort <- function(x) x[order(x[,1]),]
+customRF$levels <- function(x) x$classes
+```
+
+```{r, warning=FALSE}
+#RF is fitted in this cell, and the process is similar with what is done for full local linear regression.
+#Cross validation is performed to select optimal parameters for "mtry" and "ntree"
+#After running this cell, the optimal parameters would be mtry=2, ntree=700
+trControl=trainControl(method="cv",number=5,search="grid",
+                       classProbs=TRUE,summaryFunction = twoClassSummary)
+tuneGrid=expand.grid(.mtry=c(2,3,5,8,10),.ntree=c(20,50,100,300,500,700))
+set.seed(654321)
+crvali=train(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+             data=train_data,
+             method=customRF,
+             metric="ROC",
+             tuneGrid=tuneGrid,
+             trControl=trControl)
+
+#Then, with the best parameters, the RF is fitted again.
+set.seed(54321)
+Random_forest_mod=randomForest(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+                      data=train_data,
+                      mtry=crvali$bestTune[1,1],
+                      ntree=crvali$bestTune[1,2],
+                      importance=TRUE)
+
+#Prediction results on training set and test set are performed then.
+Random_forest_pred_train=predict(Random_forest_mod,type="prob")[,2]
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = Random_forest_pred_train,
+                                     Alive = 1-Random_forest_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "Random Forest")
+                          )
+
+Random_forest_pred_test=predict(Random_forest_mod,newdata=test_data,type="prob")[,2]
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = Random_forest_pred_test,
+                             Alive = 1-Random_forest_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "Random Forest")
+                  )
+```
+
+# SVM
+
+We used SVM with linear kernel, and cost of constraints violation parameter is tuned.
+
+```{r}
+#SVM is fitted in this cell, and the process is similar with what is done for full local linear regression.
+#Cross validation is performed to select optimal parameter for "C"
+#After running this cell, the optimal parameter would be C=0.05.
+trControl=trainControl(method="cv",number=5,search="grid",
+                       classProbs=TRUE,summaryFunction = twoClassSummary)
+tuneGrid=expand.grid(C=c(0.01,0.05,0.1,0.3,0.5,0.8,1,1.2,1.5,1.8,2,2.5,3,4))
+
+train_data.svm=train_data%>%
+  mutate(APACHE_24h=scale(APACHE_24h),
+         SOFA_24h=scale(SOFA_24h),
+         Age=scale(Age),
+         MRC_24h=scale(MRC_24h),
+         Fluid_balance_24h=scale(Fluid_balance_24h),
+         highest_heart_rate_24h=scale(highest_heart_rate_24h),
+         extreme_temperature_24h=scale(extreme_temperature_24h),
+         extreme_bicarbonate_24h=scale(extreme_bicarbonate_24h),
+         highest_creatinine_24h=scale(highest_creatinine_24h),
+         extreme_blood_glucose_24h=scale(extreme_blood_glucose_24h),
+         extreme_WBC_24h=scale(extreme_WBC_24h),
+         highest_lactate_24h=scale(highest_lactate_24h),
+         extreme_potassium_24h=scale(extreme_potassium_24h),
+         extreme_sodium_24h=scale(extreme_sodium_24h),
+         lowest_albumin_24h=scale(lowest_albumin_24h),
+         lowest_HGB_24h=scale(lowest_HGB_24h),
+         lowest_HCT_24h=scale(lowest_HCT_24h),
+         extreme_PLT_24h=scale(extreme_PLT_24h)
+         )
+
+set.seed(123456)
+crvali=train(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+               data=train_data.svm,
+               method="svmLinear",
+               metric="ROC",
+               tuneGrid=tuneGrid,
+               trControl=trControl)
+  
+#Then, with the best parameter, the SVM is fitted again.
+svm_mod=svm(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+            data=train_data.svm,
+            cost=crvali$bestTune[1,1],
+            kernel="linear",
+            probability=TRUE)
+
+#Prediction results on training set and test set are performed then.
+svm_pred_train=attr(predict(svm_mod,newdata=train_data.svm,probability=TRUE), "probabilities")[,2]
+
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = svm_pred_train,
+                                     Alive = 1-svm_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "SVM")
+                          )
+
+test_data.svm=test_data%>%
+  mutate(APACHE_24h=scale(APACHE_24h),
+         SOFA_24h=scale(SOFA_24h),
+         Age=scale(Age),
+         MRC_24h=scale(MRC_24h),
+         Fluid_balance_24h=scale(Fluid_balance_24h),
+         highest_heart_rate_24h=scale(highest_heart_rate_24h),
+         extreme_temperature_24h=scale(extreme_temperature_24h),
+         extreme_bicarbonate_24h=scale(extreme_bicarbonate_24h),
+         highest_creatinine_24h=scale(highest_creatinine_24h),
+         extreme_blood_glucose_24h=scale(extreme_blood_glucose_24h),
+         extreme_WBC_24h=scale(extreme_WBC_24h),
+         highest_lactate_24h=scale(highest_lactate_24h),
+         extreme_potassium_24h=scale(extreme_potassium_24h),
+         extreme_sodium_24h=scale(extreme_sodium_24h),
+         lowest_albumin_24h=scale(lowest_albumin_24h),
+         lowest_HGB_24h=scale(lowest_HGB_24h),
+         lowest_HCT_24h=scale(lowest_HCT_24h),
+         extreme_PLT_24h=scale(extreme_PLT_24h)
+         )
+
+svm_pred_test=attr(predict(svm_mod,newdata=test_data.svm,probability=TRUE), "probabilities")[,2]
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = svm_pred_test,
+                             Alive = 1-svm_pred_test,
+                             obs = test_data$Death_at_discharge,
+                             Group = "SVM")
+                  )
+```
+
+# XGBoost
+
+Two parameters are tuned for XGboost, which are maximum depth of a tree and max number of boosting iterations.
+
+```{r}
+#XGBoost is fitted in this cell, and the process is similar with what is done for full local linear regression.
+#Cross validation is performed to select optimal parameters for "nrounds", and "max_depth"
+#After running this cell, the optimal parameters would be nrounds=15, max_depth = 4.
+trControl=trainControl(method="cv",number=5,search="grid",
+                       classProbs=TRUE,summaryFunction = twoClassSummary)
+tuneGrid=expand.grid(max_depth=c(3,4,5,8),
+                     nrounds=c(5,7,10,11,12,13,14,15,30,40,50,100),    # number of trees
+                     # default values below
+                     eta=0.3,
+                     gamma=0,
+                     subsample=1,
+                     min_child_weight=1,
+                     colsample_bytree=0.6)
+
+set.seed(1234567)
+crvali=train(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h,
+               data=train_data,
+               method="xgbTree",
+               metric="ROC",
+               tuneGrid=tuneGrid,
+               trControl=trControl,
+               verbosity=0)
+  
+train_data_xgb=Matrix::sparse.model.matrix(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h, data=train_data)[,-1]
+train_data_xgb_label=(train_data%>%
+                        mutate(Death_at_discharge=ifelse(Death_at_discharge=="Death",1,0)))$Death_at_discharge
+train_data_xgb_final=xgb.DMatrix(data=train_data_xgb,label=train_data_xgb_label)
+  
+test_data_xgb=Matrix::sparse.model.matrix(Death_at_discharge~APACHE_24h + SOFA_24h + Age + Sex + 
+                      MRC_24h + ICU_Type + MeVe_24h + 
+                      ind_miss_Fluid_balance_24h + Fluid_balance_24h + 
+                      Admission_Diagnosis + CRRT_24h + Vasopressor_24h + 
+                      ind_miss_heart_rate_24h + highest_heart_rate_24h + 
+                      ind_miss_SBP_24h + lowest_SBP_24h + 
+                      ind_miss_temperature_24h + extreme_temperature_24h + 
+                      ind_miss_pH_24h + extreme_pH_24h + 
+                      ind_miss_bicarbonate_creatinine_sodium_24h + 
+                      extreme_bicarbonate_24h + highest_creatinine_24h + 
+                      ind_miss_blood_glucose_24h + extreme_blood_glucose_24h + 
+                      ind_miss_WBC_24h + extreme_WBC_24h + 
+                      ind_miss_lactate_24h + highest_lactate_24h + 
+                      ind_miss_potassium_24h + extreme_potassium_24h + 
+                      extreme_sodium_24h + ind_miss_albumin_24h + lowest_albumin_24h + 
+                      ind_miss_HGB_HCT_24h + lowest_HGB_24h + lowest_HCT_24h + 
+                      ind_miss_PLT_24h + extreme_PLT_24h + 
+                      ind_miss_PaO2_over_FiO2_24h + lowest_PaO2_over_FiO2_24h, data=test_data)[,-1]
+test_data_xgb_label=(test_data%>%
+                        mutate(Death_at_discharge=ifelse(Death_at_discharge=="Death",1,0)))$Death_at_discharge
+test_data_xgb_final=xgb.DMatrix(data=test_data_xgb,label=test_data_xgb_label)
+  
+#Then, with the best parameter, the XGBoost is fitted again.
+xgb_mod=xgboost(data=train_data_xgb_final,objective="binary:logistic",
+                  nrounds=crvali$bestTune[1,1],
+                  max_depth=crvali$bestTune[1,2],
+                  eta=crvali$bestTune[1,3],
+                  gamma=crvali$bestTune[1,4],
+                  colsample_bytree=crvali$bestTune[1,5],
+                  min_child_weight=crvali$bestTune[1,6],
+                  subsample=crvali$bestTune[1,7],
+                  verbose=0)
+
+#Prediction results on training set and test set are performed then.
+xgb_pred_train=predict(xgb_mod,train_data_xgb_final)
+  
+preds.death.train = rbind(preds.death.train,
+                          data.frame(Death = xgb_pred_train,
+                                     Alive = 1-xgb_pred_train,
+                                     obs = train_data$Death_at_discharge,
+                                     Group = "XGBoost")
+                          )
+
+xgb_pred_train=predict(xgb_mod,test_data_xgb_final)
+
+preds.death=rbind(preds.death,
+                  data.frame(Death = xgb_pred_train,
+                             Alive = 1-xgb_pred_train,
+                             obs = test_data$Death_at_discharge,
+                             Group = "XGBoost")
+                  )
+```
